@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { api } from "../api.js";
+import logoImg from "../assets/logo.png";
 
 export default function Login({ onLogin }) {
   const [email, setEmail] = useState("");
@@ -43,9 +44,16 @@ export default function Login({ onLogin }) {
     <div className="min-h-screen bg-gray-50">
       <div className="mx-auto flex min-h-screen max-w-md items-center justify-center px-4">
         <div className="w-full rounded-2xl border border-gray-200 bg-white p-6 shadow-sm">
-          <div className="mb-5">
-            <h2 className="text-xl font-semibold tracking-tight">ProjectTrack Login</h2>
-            <p className="mt-1 text-sm text-gray-500">Sign in to continue to your workspace</p>
+          <div className="mb-5 flex items-center gap-3">
+            <img
+              src={logoImg}
+              alt="WorkTracker"
+              className="w-10 h-10 rounded-xl object-contain border border-gray-100 shadow-xs"
+            />
+            <div>
+              <h2 className="text-xl font-semibold tracking-tight text-gray-900">ProjectTrack Login</h2>
+              <p className="mt-0.5 text-xs text-gray-500">Sign in to continue to your workspace</p>
+            </div>
           </div>
 
           {error && (

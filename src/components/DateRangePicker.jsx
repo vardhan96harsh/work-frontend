@@ -3,7 +3,13 @@ import { DayPicker } from "react-day-picker";
 import "react-day-picker/dist/style.css";
 import { format, startOfDay, endOfDay } from "date-fns";
 
-function iso(d) { return d.toISOString().slice(0,10); }
+function iso(d) {
+  if (!d) return "";
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
 function parseISOish(s) {
   if (!s) return undefined;
   const d = new Date(s);
@@ -42,18 +48,20 @@ export default function DateRangePicker({ from, to, onChange, className = "" }) 
   }, []);
 
   return (
-    <div className={`relative inline-block ${className}`} ref={pickerRef}>
+    <div className={`relative inline-block z-40 ${className}`} ref={pickerRef}>
       <button
+        type="button"
         onClick={() => setOpen(v => !v)}
-        className="rounded-md border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm hover:bg-gray-50"
+        className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3.5 py-2 text-xs font-bold text-slate-700 shadow-sm transition hover:bg-slate-50 hover:border-slate-300 focus:outline-none focus:ring-2 focus:ring-blue-100"
         title="Pick date range"
       >
-        📅 {label}
+        <span>📅</span>
+        <span>{label}</span>
       </button>
 
       {open && (
         <div
-          className="absolute z-50 mt-1 rounded-lg border border-gray-200 bg-white shadow-xl p-2"
+          className="absolute left-0 top-full z-50 mt-2 rounded-2xl border border-slate-200 bg-white shadow-2xl p-3"
           style={{ width: 330 }}
         >
           <DayPicker

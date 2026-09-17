@@ -1,3 +1,4 @@
+import React, { useState } from "react";
 import * as XLSX from "xlsx-js-style";
 import { saveAs } from "file-saver";
 
@@ -19,11 +20,12 @@ function formatTimeFromMinutes(totalMinutes) {
 }
 
 export default function ExportProjectExcel({ projectsTree, from, to }) {
+  const [msg, setMsg] = useState("");
 
   const exportProjectExcel = () => {
-
     if (!projectsTree || projectsTree.length === 0) {
-      alert("No project data available.");
+      setMsg("No project data available");
+      setTimeout(() => setMsg(""), 3000);
       return;
     }
 
@@ -209,11 +211,18 @@ export default function ExportProjectExcel({ projectsTree, from, to }) {
   };
 
   return (
-    <button
-      onClick={exportProjectExcel}
-      className="rounded-lg bg-gray-900 text-white px-4 py-1 text-sm hover:bg-black"
-    >
-      Export Project Report
-    </button>
+    <div className="relative inline-flex items-center gap-2">
+      <button
+        onClick={exportProjectExcel}
+        className="rounded-lg bg-gray-900 text-white px-4 py-1 text-sm hover:bg-black transition"
+      >
+        Export Project Report
+      </button>
+      {msg && (
+        <span className="text-xs font-semibold text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-2 py-1 animate-in fade-in duration-150">
+          {msg}
+        </span>
+      )}
+    </div>
   );
 }

@@ -24,6 +24,32 @@ export default function App() {
     window.worktracker?.setOverlayEnabled?.(isEmployee);
   }, [auth]);
 
+  // 🔄 Sync auth state whenever tokens are silently refreshed
+  useEffect(() => {
+    const handleRefreshed = (e) => {
+      if (e.detail) setAuth(e.detail);
+    };
+    const handleExpired = () => {
+      setAuth(null);
+    };
+
+    window.addEventListener("auth:refreshed", handleRefreshed);
+    window.addEventListener("auth:expired", handleExpired);
+
+    return () => {
+      window.removeEventListener("auth:refreshed", handleRefreshed);
+      window.removeEventListener("auth:expired", handleExpired);
+    };
+  }, []);
+
+  // 🚪 Global App Close handler: Ensures window always closes smoothly across all screens
+  useEffect(() => {
+    const off = window.worktracker?.onAppClosing?.(() => {
+      window.worktracker?.confirmAppClose?.();
+    });
+    return () => typeof off === "function" && off();
+  }, []);
+
   async function handleLogout() {
     try {
       await api("/api/work-sessions/stop", {
@@ -42,7 +68,13 @@ export default function App() {
     typeof window !== "undefined" &&
     window.location.hash.includes("/overlay");
 
-  if (isOverlay) return <OverlayWidget />;
+  if (isOverlay)
+    return (
+      <>
+        <GlobalHeartbeat auth={auth} />
+        <OverlayWidget />
+      </>
+    );
   if (!auth) return <Login onLogin={setAuth} />;
 
   if (auth.user?.role === "admin")

@@ -1,9 +1,10 @@
 import React, { useEffect, useRef, useState, useMemo } from "react";
 import { api } from "../../api.js";
 import DateRangePicker from "../../components/DateRangePicker";
+import { offlineManager } from "../../utils/offlineManager.js";
+import { Wifi, WifiOff, RefreshCw, ListTodo, FolderKanban, RotateCw } from "lucide-react";
 
-
-export default function WorkTimer({ auth }) {
+export default function WorkTimer({ auth, initialSelectedTask }) {
   // ---------------- STATES ----------------
   const [companies, setCompanies] = useState([]);
   const [categories, setCategories] = useState([]);
@@ -15,6 +16,11 @@ export default function WorkTimer({ auth }) {
   // Work Type (Project Mode Only)
   const [workTypes, setWorkTypes] = useState([]);
   const [workType, setWorkType] = useState("");
+
+  // ── Assigned Tasks (from Admin task management) ──
+  const [assignedTasks, setAssignedTasks] = useState([]);
+  const [allMyTasks, setAllMyTasks] = useState([]);
+  const [selectedTaskId, setSelectedTaskId] = useState("");
 
   // Filters
   const [companyId, setCompanyId] = useState("");
@@ -39,7 +45,6 @@ export default function WorkTimer({ auth }) {
   const [projectTotals, setProjectTotals] = useState([]);
   const [projectLoading, setProjectLoading] = useState(false);
 
-
   // Stopwatch
   const [elapsed, setElapsed] = useState(0);
   const timerRef = useRef(null);
@@ -49,6 +54,26 @@ export default function WorkTimer({ auth }) {
 
   const resumeInProgressRef = useRef(false);
 
+  // 🌐 Offline State
+  const [isOffline, setIsOffline] = useState(offlineManager.isOffline());
+  const [isSyncing, setIsSyncing] = useState(false);
+
+  useEffect(() => {
+    const unsub = offlineManager.subscribe((event, data) => {
+      if (event === "networkStatus") setIsOffline(data.isOffline);
+      if (event === "syncing") setIsSyncing(data);
+      if (event === "syncSuccess") {
+        setIsOffline(false);
+        loadSessionsAndTick();
+      }
+    });
+    return unsub;
+  }, []);
+
+  // 🧹 Clean up ticker interval on unmount to prevent memory leaks
+  useEffect(() => {
+    return () => clearTicker();
+  }, []);
 
   const loadingSessionsRef = useRef(false);
 
@@ -58,8 +83,6 @@ export default function WorkTimer({ auth }) {
     to: null,
   });
 
-
-
   useEffect(() => {
     activeSessionRef.current = activeSession;
   }, [activeSession]);
@@ -67,9 +90,10 @@ export default function WorkTimer({ auth }) {
   // Machine Info
   const [machine, setMachine] = useState(null);
   useEffect(() => {
-    window.worktracker?.getConfig?.()
-      .then(cfg => setMachine(cfg))
-      .catch(() => { });
+    window.worktracker
+      ?.getConfig?.()
+      .then((cfg) => setMachine(cfg))
+      .catch(() => {});
   }, []);
 
   // ---- helpers ----
@@ -78,26 +102,22 @@ export default function WorkTimer({ auth }) {
     const hours = Math.floor(totalSeconds / 3600);
     const minutes = Math.floor((totalSeconds % 3600) / 60);
     const seconds = totalSeconds % 60;
-    const centis = Math.floor((ms % 1000) / 10);
     return (
       String(hours).padStart(2, "0") +
       ":" +
       String(minutes).padStart(2, "0") +
       ":" +
-      String(seconds).padStart(2, "0") +
-      "." +
-      String(centis).padStart(2, "0")
+      String(seconds).padStart(2, "0")
     );
   }
 
   function minutesToHHMM(mins) {
-    const totalSeconds = Math.round(mins * 60);
+    const totalSeconds = Math.max(0, Math.round((mins || 0) * 60));
     const hours = Math.floor(totalSeconds / 3600);
     const minutes = Math.floor((totalSeconds % 3600) / 60);
-    return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+    const seconds = totalSeconds % 60;
+    return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   }
-
-
 
   function clearTicker() {
     if (timerRef.current) {
@@ -106,20 +126,37 @@ export default function WorkTimer({ auth }) {
     }
   }
 
-  // ---- loaders ----
-  async function loadMaster() {
-    setError("");
-    try {
-      const [c, g] = await Promise.all([
-        api("/api/companies", { token: auth.token }),
-        api("/api/categories", { token: auth.token }),
-      ]);
-      setCompanies(c || []);
-      setCategories(g || []);
-    } catch (e) {
-      setError("Could not load master data. Please retry.");
-    }
+  function getLocalDateStr(d = new Date()) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
   }
+
+  // ---- loaders ----
+async function loadMaster() {
+  setError("");
+
+  try {
+    const [c, g] = await Promise.all([
+      api("/api/companies", { token: auth.token }),
+      api("/api/categories", { token: auth.token }),
+    ]);
+
+    // Company names in alphabetical order A-Z
+    setCompanies(
+      [...(c || [])].sort((a, b) =>
+        (a.name || "").localeCompare(b.name || "", undefined, {
+          sensitivity: "base",
+        }),
+      ),
+    );
+
+    setCategories(g || []);
+  } catch (e) {
+    setError("Could not load master data. Please retry.");
+  }
+}
 
   async function loadProjects() {
     setError("");
@@ -130,74 +167,146 @@ export default function WorkTimer({ auth }) {
     try {
       const list = await api(
         `/api/projects?company=${companyId}&category=${categoryId}`,
-        { token: auth.token }
+        { token: auth.token },
       );
-      setProjects(list || []);
+      setProjects(
+        (list || []).sort((a, b) =>
+          (a.name || "").localeCompare(b.name || "", undefined, { sensitivity: "base" })
+        )
+      );
     } catch (e) {
       setError("Could not load projects.");
+    }
+  }
+
+  function startLocalTicker(session) {
+    clearTicker();
+    if (session?.status === "active") {
+      const baseMs = Math.max(0, (session.accumulatedMinutes || 0) * 60000);
+      const start = new Date(
+        session.currentStart || session.createdAt || Date.now()
+      ).getTime();
+
+      const update = () => {
+        setElapsed(baseMs + Math.max(0, Date.now() - start));
+      };
+
+      update();
+      timerRef.current = setInterval(update, 1000);
+    } else if (session?.status === "paused") {
+      setElapsed(Math.max(0, (session.totalMinutes || session.accumulatedMinutes || 0) * 60000));
+    } else {
+      setElapsed(0);
     }
   }
 
   async function loadSessionsAndTick() {
     if (loadingSessionsRef.current) return;
     loadingSessionsRef.current = true;
-
-    setError("");
     setLoading(true);
 
-    try {
-      // ✅ USE DATE RANGE IF SELECTED
-      let fromDate, toDate;
+    const prevSessions = sessions;
+    const prevActiveSession = activeSession;
+    const prevElapsed = elapsed;
 
-      if (range.from && range.to) {
-        fromDate = range.from;
-        toDate = range.to;
-      } else {
-        // fallback = last 7 days
-        const to = new Date();
-        const from = new Date();
-        from.setDate(to.getDate() - 7);
-        fromDate = from.toISOString().slice(0, 10);
-        toDate = to.toISOString().slice(0, 10);
+    try {
+      // 🌐 First, if online and there are queued offline sessions, reconcile with server
+      if (!offlineManager.isOffline() && auth?.token) {
+        await offlineManager.syncWithServer(auth.token);
+      }
+
+      let fromDate = range.from;
+      let toDate = range.to;
+
+      const now = new Date();
+      if (!fromDate || !toDate) {
+        if (dateFilter === "week") {
+          const start = new Date(now);
+          const day = start.getDay();
+          const diff = start.getDate() - day + (day === 0 ? -6 : 1);
+          start.setDate(diff);
+          fromDate = getLocalDateStr(start);
+          toDate = getLocalDateStr(now);
+        } else if (dateFilter === "month") {
+          const start = new Date(now.getFullYear(), now.getMonth(), 1);
+          fromDate = getLocalDateStr(start);
+          toDate = getLocalDateStr(now);
+        } else {
+          // "today"
+          const todayStr = getLocalDateStr(now);
+          fromDate = todayStr;
+          toDate = todayStr;
+        }
       }
 
       const sess = await api(
         `/api/work-sessions/my?from=${fromDate}&to=${toDate}`,
-        { token: auth.token }
+        { token: auth.token },
       );
+
+      offlineManager.setOffline(false);
+      setIsOffline(false);
 
       const arr = Array.isArray(sess) ? sess : [];
       setSessions(arr);
 
-      const running = arr.find(x => x.status === "active");
-      const paused = arr.find(x => x.status === "paused");
+      const running = arr.find((x) => x.status === "active");
+      const paused = arr.find((x) => x.status === "paused");
       const current = running || paused || null;
 
-      clearTicker();
-      setActiveSession(current);
-
-      if (running) {
-        const baseMs = (running.accumulatedMinutes || 0) * 60000;
-        const start = new Date(running.currentStart || running.createdAt).getTime();
-
-        const update = () => {
-          setElapsed(baseMs + (Date.now() - start));
-        };
-
-        update();
-        timerRef.current = setInterval(update, 100);
-      } else {
-        setElapsed((paused?.totalMinutes || 0) * 60000);
+      const todayStr = getLocalDateStr(new Date());
+      const isTodayIncluded = !range.from || (range.from <= todayStr && (!range.to || range.to >= todayStr));
+      if (isTodayIncluded || current) {
+        setActiveSession(current);
+        activeSessionRef.current = current;
+        startLocalTicker(current);
       }
-    } catch {
-      setError("Could not load sessions.");
+      setError("");
+    } catch (e) {
+      console.error("LOAD SESSION ERROR 👉", e);
+
+      // 🌐 Check if this is an offline error
+      const offlineDetected = e?.isOffline || !navigator.onLine || e?.status === 0;
+      if (offlineDetected) {
+        offlineManager.setOffline(true);
+        setIsOffline(true);
+
+        const offSess = offlineManager.getOfflineSession();
+        if (offSess) {
+          setActiveSession(offSess);
+          activeSessionRef.current = offSess;
+          setSessions((prev) => {
+            const exists = prev.some((s) => s._id === offSess._id);
+            return exists ? prev.map((s) => (s._id === offSess._id ? offSess : s)) : [offSess, ...prev];
+          });
+          startLocalTicker(offSess);
+        } else {
+          setSessions(prevSessions);
+          setActiveSession(prevActiveSession);
+          activeSessionRef.current = prevActiveSession;
+          setElapsed(prevElapsed);
+        }
+        setError(""); // Smooth fallback, no red error alert
+      } else {
+        setSessions(prevSessions);
+        setActiveSession(prevActiveSession);
+        activeSessionRef.current = prevActiveSession;
+        setElapsed(prevElapsed);
+
+        const status = e?.status || e?.response?.status;
+        if (status === 401) {
+          setError(
+            "Session sync failed because login token expired. Please login again.",
+          );
+        } else {
+          setError("Could not sync sessions. Showing last known session data.");
+        }
+      }
     } finally {
       setLoading(false);
       loadingSessionsRef.current = false;
     }
   }
-
-
 
   async function loadWorkTypes() {
     try {
@@ -207,16 +316,127 @@ export default function WorkTimer({ auth }) {
       const arr =
         Array.isArray(list) && list.length
           ? list
-          : ["Alpha", "Beta", "CR", "Rework", "poc", "Analysis", "Storyboard QA", "Output QA"];
+          : [
+              "Alpha",
+              "Beta",
+              "CR",
+              "Rework",
+              "poc",
+              "Analysis",
+              "Storyboard QA",
+              "Output QA",
+            ];
       setWorkTypes(arr);
       if (!workType && arr.length) setWorkType(arr[0]);
     } catch (e) {
-      const fallback = ["Alpha", "Beta", "CR", "Rework", "poc", "Analysis", "Storyboard QA", "Output QA"];
+      const fallback = [
+        "Alpha",
+        "Beta",
+        "CR",
+        "Rework",
+        "poc",
+        "Analysis",
+        "Storyboard QA",
+        "Output QA",
+      ];
       setWorkTypes(fallback);
       if (!workType) setWorkType(fallback[0]);
     }
   }
 
+  // ── Load tasks for the chosen project (assigned to user or in project plan)
+  async function loadAssignedTasks(pid) {
+    if (!pid) {
+      setAssignedTasks([]);
+      return;
+    }
+    try {
+      const [projectTasks, myTasks] = await Promise.all([
+        api(`/api/tasks?projectId=${pid}`, { token: auth.token }).catch(() => []),
+        api(`/api/tasks/my?projectId=${pid}`, { token: auth.token }).catch(() => []),
+      ]);
+
+      const myTaskIds = new Set((Array.isArray(myTasks) ? myTasks : []).map((t) => t._id));
+      const pList = Array.isArray(projectTasks) ? projectTasks : [];
+      const mList = Array.isArray(myTasks) ? myTasks : [];
+
+      // Combine without duplicates
+      const seen = new Set();
+      const combined = [];
+
+      for (const t of [...mList, ...pList]) {
+        if (!seen.has(t._id)) {
+          seen.add(t._id);
+          combined.push({
+            ...t,
+            isMyTask: myTaskIds.has(t._id),
+          });
+        }
+      }
+
+      // Sort: user's assigned tasks first, then alphabetically
+      combined.sort((a, b) => {
+        if (a.isMyTask && !b.isMyTask) return -1;
+        if (!a.isMyTask && b.isMyTask) return 1;
+        return (a.title || "").localeCompare(b.title || "", undefined, { sensitivity: "base" });
+      });
+
+      setAssignedTasks(combined);
+    } catch {
+      setAssignedTasks([]);
+    }
+  }
+
+  // ── Load all assigned tasks for the employee ──
+  async function loadAllMyTasks() {
+    try {
+      const data = await api("/api/tasks/my", { token: auth.token });
+      setAllMyTasks(Array.isArray(data) ? data : []);
+    } catch {
+      setAllMyTasks([]);
+    }
+  }
+
+  function parseTaskDetails(task) {
+    let phase = "";
+    let deliverable = "";
+    if (task?.description) {
+      const pMatch = task.description.match(/Phase:\s*([^|]+)/i);
+      if (pMatch) phase = pMatch[1].trim();
+      const dMatch = task.description.match(/Deliverable:\s*(.+)/i);
+      if (dMatch) deliverable = dMatch[1].trim();
+    }
+    return {
+      phase: phase && phase !== "General" ? phase : null,
+      deliverable: deliverable && deliverable !== "N/A" ? deliverable : null,
+    };
+  }
+
+  function selectAssignedTask(task) {
+    if (!task) return;
+    setMode("project");
+    const p = task.project;
+    const pid = typeof p === "object" ? p?._id : p;
+    if (pid) {
+      if (typeof p === "object") {
+        const compId = p.company?._id || p.company;
+        const catId = p.category?._id || p.category;
+        if (compId) setCompanyId(compId);
+        if (catId) setCategoryId(catId);
+        if (p.name) {
+          setProjects((prev) => (prev.some((x) => x._id === pid) ? prev : [...prev, p]));
+        }
+      }
+      setProjectId(pid);
+    }
+    setSelectedTaskId(task._id);
+    if (pid) {
+      localStorage.setItem("lastProjectId", pid);
+    }
+    if (task.taskType) {
+      setWorkType(task.taskType);
+    }
+  }
 
   async function safeAutoResume(flagKey) {
     if (resumeInProgressRef.current) return;
@@ -228,38 +448,24 @@ export default function WorkTimer({ auth }) {
     if (!cur || cur.status !== "paused") return;
 
     resumeInProgressRef.current = true;
-    localStorage.removeItem(flagKey);
-
     try {
       await resume();
+      localStorage.removeItem(flagKey);
     } finally {
-      setTimeout(() => {
-        resumeInProgressRef.current = false;
-      }, 500);
+      resumeInProgressRef.current = false;
     }
   }
 
-
-  // ---- effects ----
+  // Initial load
   useEffect(() => {
     (async () => {
       await loadMaster();
       await loadWorkTypes();
+      await loadAllMyTasks();
       await loadSessionsAndTick();
     })();
     return () => clearTicker();
   }, []);
-
-  // 🔥 AUTO REFRESH ONLY WHEN NO DATE RANGE IS SELECTED
-  useEffect(() => {
-    if (range.from && range.to) return; // ⛔ stop auto refresh
-
-    const interval = setInterval(() => {
-      loadSessionsAndTick();
-    }, 10000);
-
-    return () => clearInterval(interval);
-  }, [range.from, range.to]);
 
 
   useEffect(() => {
@@ -268,35 +474,28 @@ export default function WorkTimer({ auth }) {
     if (!companyId || !categoryId) return;
 
     const interval = setInterval(() => {
-      loadProjects(); // 🔥 refresh project list
-    }, 20000); // every 20 seconds
+      loadProjects(); // 🔥 refresh project list gently
+    }, 60000); // every 60 seconds (prevents constant network and CPU churn)
 
     return () => clearInterval(interval);
   }, [companyId, categoryId]);
 
+  // ── Load assigned tasks whenever project changes ──
+  useEffect(() => {
+    if (projectId) {
+      loadAssignedTasks(projectId);
+    } else {
+      setAssignedTasks([]);
+      setSelectedTaskId("");
+    }
+  }, [projectId]);
 
-  // Keyboard shortcuts
-  // useEffect(() => {
-  //   const onKey = (e) => {
-  //     if (
-  //       e.target.tagName === "INPUT" ||
-  //       e.target.tagName === "SELECT" ||
-  //       e.target.tagName === "TEXTAREA"
-  //     )
-  //       return;
-  //     const k = e.key.toLowerCase();
-  //     if (k === "s") start();
-  //     if (k === "p" || k === " ") {
-  //       e.preventDefault();
-  //       if (activeSession?.status === "active") pause();
-  //       else if (activeSession?.status === "paused") resume();
-  //     }
-  //     if (k === "r") resume();
-  //     if (k === "x") stop();
-  //   };
-  //   window.addEventListener("keydown", onKey);
-  //   return () => window.removeEventListener("keydown", onKey);
-  // }, [activeSession, projectId, elapsed]);
+  // ── Pre-select task if launched from "My Tasks" portal ──
+  useEffect(() => {
+    if (initialSelectedTask) {
+      selectAssignedTask(initialSelectedTask);
+    }
+  }, [initialSelectedTask]);
 
   // Refresh from other windows
   useEffect(() => {
@@ -308,6 +507,17 @@ export default function WorkTimer({ auth }) {
     };
   }, []);
 
+  // 🔄 Periodic auto-sync (every 15s) to guarantee WorkTimer and Overlay never desync
+  useEffect(() => {
+    const syncInterval = setInterval(() => {
+      if (!offlineManager.isOffline() && !loadingSessionsRef.current) {
+        loadSessionsAndTick();
+      }
+    }, 15000);
+
+    return () => clearInterval(syncInterval);
+  }, [dateFilter, range.from, range.to]);
+
   // System sleep/idle handlers (unchanged)
   useEffect(() => {
     const handler = () => {
@@ -318,7 +528,7 @@ export default function WorkTimer({ auth }) {
       localStorage.setItem("wt_auto_paused", "1");
 
       clearTicker();
-      setElapsed(prev => prev);
+      setElapsed((prev) => prev);
 
       pause();
     };
@@ -337,8 +547,6 @@ export default function WorkTimer({ auth }) {
 
       autoPausedRef.current = false;
       safeAutoResume("wt_auto_paused");
-
-
     };
 
     const off = window.worktracker?.onSystemWake?.(handler);
@@ -353,7 +561,7 @@ export default function WorkTimer({ auth }) {
       localStorage.setItem("wt_idle_paused", "1");
 
       clearTicker();
-      setElapsed(prev => prev);
+      setElapsed((prev) => prev);
 
       pause();
     };
@@ -371,8 +579,6 @@ export default function WorkTimer({ auth }) {
       if (!cur || cur.status !== "paused") return;
 
       safeAutoResume("wt_idle_paused");
-
-
     };
 
     const off = window.worktracker?.onSystemActive?.(handler);
@@ -380,25 +586,32 @@ export default function WorkTimer({ auth }) {
   }, []);
 
   useEffect(() => {
+    let lastCheck = 0;
     const activityHandler = () => {
-      const flag = localStorage.getItem("wt_auto_paused");
-      if (flag !== "1") return;
+      // Throttle: check at most once every 1.5 seconds to prevent freezing on mousemove
+      const now = Date.now();
+      if (now - lastCheck < 1500) return;
+      lastCheck = now;
 
-      autoPausedRef.current = false;
-      safeAutoResume("wt_auto_paused");
+      const autoPaused = localStorage.getItem("wt_auto_paused");
+      const idlePaused = localStorage.getItem("wt_idle_paused");
 
-
+      if (autoPaused === "1") {
+        autoPausedRef.current = false;
+        safeAutoResume("wt_auto_paused");
+      } else if (idlePaused === "1") {
+        safeAutoResume("wt_idle_paused");
+      }
     };
 
-    window.addEventListener("mousemove", activityHandler);
-    window.addEventListener("keydown", activityHandler);
+    window.addEventListener("mousemove", activityHandler, { passive: true });
+    window.addEventListener("keydown", activityHandler, { passive: true });
 
     return () => {
       window.removeEventListener("mousemove", activityHandler);
       window.removeEventListener("keydown", activityHandler);
     };
   }, []);
-
 
   useEffect(() => {
     const off = window.worktracker?.onAppClosing?.(() => {
@@ -410,7 +623,41 @@ export default function WorkTimer({ auth }) {
     return () => typeof off === "function" && off();
   }, []);
 
+  // ⏱️ Synchronize timer running state with Electron and idle alert
+  useEffect(() => {
+    const isRunning = Boolean(
+      activeSession && (activeSession.status === "active" || activeSession.status === "paused")
+    );
+    window.worktracker?.setTimerRunning?.(isRunning);
 
+    // Actively running (ticking) vs stopped/paused
+    const isTimerActive = Boolean(activeSession && activeSession.status === "active");
+    window.dispatchEvent(
+      new CustomEvent("timer:statusChanged", {
+        detail: {
+          isRunning: isTimerActive,
+          status: activeSession?.status || "stopped",
+        },
+      })
+    );
+  }, [activeSession]);
+
+  // 🎯 Highlight and focus start button when reminder "Start Timer Now" is clicked
+  useEffect(() => {
+    const handleFocusStart = () => {
+      const btn = document.getElementById("work-timer-start-btn");
+      if (btn) {
+        btn.scrollIntoView({ behavior: "smooth", block: "center" });
+        btn.focus();
+        btn.classList.add("ring-4", "ring-emerald-400", "scale-105");
+        setTimeout(() => {
+          btn.classList.remove("ring-4", "ring-emerald-400", "scale-105");
+        }, 1800);
+      }
+    };
+    window.addEventListener("timer:focusStart", handleFocusStart);
+    return () => window.removeEventListener("timer:focusStart", handleFocusStart);
+  }, []);
 
   // 🔥 LOAD SESSIONS WHEN DATE RANGE CHANGES
   useEffect(() => {
@@ -431,27 +678,17 @@ export default function WorkTimer({ auth }) {
   const hasPaused = activeSession?.status === "paused";
   const anyCurrent = Boolean(activeSession);
 
-  ///  // 🔥 HEARTBEAT: ping backend every 30 seconds if session is running
-  // useEffect(() => {
-  //   if (!hasRunning) return;
+  const activeProjId = activeSession?.projectId || (typeof activeSession?.project === "object" ? activeSession?.project?._id : activeSession?.project);
+  const activeTaskId = activeSession?.taskId || (typeof activeSession?.task === "object" ? activeSession?.task?._id : activeSession?.task);
+  const activeCustom = activeSession?.customTask || "";
 
-  //   const interval = setInterval(() => {
-  //     api("/api/work-sessions/heartbeat", {
-  //       method: "POST",
-  //       token: auth.token,
-  //     }).then(() => {
-  //       console.log("💓 Heartbeat sent");
-  //     })
-  //       .catch((err) => {
-  //         console.log("❌ Heartbeat failed:", err.message);
-  //       });
+  const isSameContext = anyCurrent && (
+    mode === "project"
+      ? (activeProjId === projectId && (!selectedTaskId || activeTaskId === selectedTaskId))
+      : (mode === "custom" && activeCustom === customTask.trim())
+  );
 
-  //   }, 30_000); // every 30 seconds
-
-  //   return () => clearInterval(interval);
-  // }, [hasRunning]);
-
-
+  const selectedProj = projects.find((p) => p._id === projectId);
 
   // ---- actions ----
   async function start() {
@@ -466,10 +703,21 @@ export default function WorkTimer({ auth }) {
       return setError("Please enter a custom task.");
     }
 
+    if (mode === "project" && projectId) {
+      localStorage.setItem("lastProjectId", projectId);
+    }
+
+    const selectedProj = projects.find((p) => p._id === projectId);
+    const selectedTaskObj =
+      assignedTasks.find((t) => t._id === selectedTaskId) ||
+      allMyTasks.find((t) => t._id === selectedTaskId);
+
     try {
       const body = {
         taskType: mode === "project" ? workType : undefined,
         projectId: mode === "project" ? projectId : null,
+        taskId: mode === "project" && selectedTaskId ? selectedTaskId : null,
+        taskTitle: mode === "project" && selectedTaskObj ? selectedTaskObj.title : null,
         customTask: mode === "custom" ? customTask.trim() : null,
         remarks: "",
       };
@@ -480,10 +728,35 @@ export default function WorkTimer({ auth }) {
         body,
       });
 
+      offlineManager.setOffline(false);
+      setIsOffline(false);
       window.worktracker?.notifySessionsChanged?.();
       await loadSessionsAndTick();
     } catch (e) {
-      setError(e.message || "Failed to start session.");
+      // 🌐 OFFLINE FALLBACK: Start session in local cache seamlessly
+      if (e?.isOffline || !navigator.onLine || e?.status === 0) {
+        console.log("🌐 Network offline -> starting session in local cache");
+        const offSess = offlineManager.startOfflineSession({
+          projectId: mode === "project" ? projectId : null,
+          projectName: mode === "project" ? selectedProj?.name : "(Custom Task)",
+          taskId: mode === "project" && selectedTaskId ? selectedTaskId : null,
+          taskTitle: selectedTaskObj?.title || null,
+          companyName: selectedProj?.company?.name || "—",
+          categoryName: selectedProj?.category?.name || "—",
+          customTask: mode === "custom" ? customTask.trim() : null,
+          taskType: mode === "project" ? workType : "Alpha",
+          remarks: "",
+        });
+
+        setActiveSession(offSess);
+        activeSessionRef.current = offSess;
+        setSessions((prev) => [offSess, ...prev.filter((s) => s._id !== offSess._id)]);
+        startLocalTicker(offSess);
+        setIsOffline(true);
+        window.worktracker?.notifySessionsChanged?.();
+      } else {
+        setError(e.message || "Failed to start session.");
+      }
     }
   }
 
@@ -494,44 +767,109 @@ export default function WorkTimer({ auth }) {
         method: "POST",
         token: auth.token,
       });
+
+      offlineManager.setOffline(false);
+      setIsOffline(false);
       window.worktracker?.notifySessionsChanged?.();
       await loadSessionsAndTick();
-    } catch {
-      setError("Failed to pause session.");
+    } catch (e) {
+      // 🌐 OFFLINE FALLBACK: Pause session in local cache
+      if (e?.isOffline || !navigator.onLine || e?.status === 0) {
+        console.log("🌐 Network offline -> pausing session in local cache");
+        const pausedSess = offlineManager.pauseOfflineSession();
+        if (pausedSess) {
+          clearTicker();
+          setActiveSession(pausedSess);
+          activeSessionRef.current = pausedSess;
+          setSessions((prev) => [pausedSess, ...prev.filter((s) => s._id !== pausedSess._id)]);
+          setIsOffline(true);
+          window.worktracker?.notifySessionsChanged?.();
+        }
+      } else {
+        console.error("Pause failed:", e);
+        setError(e?.message || "Failed to pause session.");
+      }
     }
   }
 
   async function resume() {
     setError("");
+    const targetSessionId = activeSession?._id || activeSessionRef.current?._id;
     try {
       await api("/api/work-sessions/resume", {
         method: "POST",
         token: auth.token,
+        body: {
+          sessionId: targetSessionId && !String(targetSessionId).startsWith("temp-") && !String(targetSessionId).startsWith("offline-")
+            ? targetSessionId
+            : undefined,
+        },
       });
+
+      offlineManager.setOffline(false);
+      setIsOffline(false);
       window.worktracker?.notifySessionsChanged?.();
       await loadSessionsAndTick();
-    } catch {
-      setError("Failed to resume session.");
+    } catch (e) {
+      // 🌐 OFFLINE FALLBACK: Resume session in local cache
+      if (e?.isOffline || !navigator.onLine || e?.status === 0) {
+        console.log("🌐 Network offline -> resuming session in local cache");
+        const resumedSess = offlineManager.resumeOfflineSession();
+        if (resumedSess) {
+          setActiveSession(resumedSess);
+          activeSessionRef.current = resumedSess;
+          setSessions((prev) => [resumedSess, ...prev.filter((s) => s._id !== resumedSess._id)]);
+          startLocalTicker(resumedSess);
+          setIsOffline(true);
+          window.worktracker?.notifySessionsChanged?.();
+        }
+      } else {
+        console.error("Resume failed:", e);
+        setError(e?.message || "Failed to resume session.");
+      }
     }
   }
 
   async function stop() {
     setError("");
+    clearTicker();
+    setActiveSession(null);
+    activeSessionRef.current = null;
+    setElapsed(0);
+
     try {
       await api("/api/work-sessions/stop", {
         method: "POST",
         token: auth.token,
         body: {},
       });
+
+      offlineManager.setOffline(false);
+      setIsOffline(false);
       window.worktracker?.notifySessionsChanged?.();
       await loadSessionsAndTick();
-    } catch {
-      setError("Failed to stop session.");
+    } catch (e) {
+      // 🌐 OFFLINE FALLBACK: Stop session in local cache
+      if (e?.isOffline || !navigator.onLine || e?.status === 0) {
+        console.log("🌐 Network offline -> stopping session in local cache");
+        const stoppedSess = offlineManager.stopOfflineSession();
+        if (stoppedSess) {
+          clearTicker();
+          setActiveSession(null);
+          activeSessionRef.current = null;
+          setElapsed(0);
+          setSessions((prev) => [stoppedSess, ...prev.filter((s) => s._id !== stoppedSess._id)]);
+          setIsOffline(true);
+          window.worktracker?.notifySessionsChanged?.();
+        }
+      } else {
+        console.error("Stop failed:", e);
+        setError(e?.message || "Failed to stop session.");
+      }
     }
   }
 
   // ---- derived UI state ----
-
 
   function getTodayMs(s, now = Date.now()) {
     let ms = (s.accumulatedMinutes || 0) * 60000;
@@ -543,10 +881,8 @@ export default function WorkTimer({ auth }) {
     return Math.max(0, ms);
   }
 
-
-
   const todaysTotalMs = useMemo(() => {
-    const todayStr = new Date().toISOString().slice(0, 10);
+    const todayStr = getLocalDateStr(new Date());
 
     let sum = 0;
     for (const s of sessions) {
@@ -557,21 +893,23 @@ export default function WorkTimer({ auth }) {
     return sum;
   }, [sessions, elapsed]);
 
-
-
+  const todaysSessionsCount = useMemo(() => {
+    const todayStr = getLocalDateStr(new Date());
+    return sessions.filter((s) => s.date === todayStr).length;
+  }, [sessions]);
 
   const employeeName = auth?.user?.name || "Employee";
   const [expanded, setExpanded] = useState({});
 
   const groupedSessions = useMemo(() => {
     const map = new Map();
+    const now = Date.now();
 
     for (const s of sessions) {
-      const key =
-        s.projectId
-          ? `${s.date}|project|${s.projectId}|${s.taskType || "none"}`
-          : `${s.date}|custom|${s._id}`;
-
+      const taskKey = s.taskId || s.taskTitle || (s.customTask ? `custom-${s.customTask}` : "none");
+      const key = s.projectId
+        ? `${s.date}|project|${s.projectId}|${s.taskType || "none"}|${taskKey}`
+        : `${s.date}|custom|${s.customTask ? `custom-${s.customTask}` : s._id}`;
 
       if (!map.has(key)) {
         map.set(key, {
@@ -579,29 +917,35 @@ export default function WorkTimer({ auth }) {
           date: s.date,
           companyName: s.companyName || "—",
           categoryName: s.categoryName || "—",
-          projectName: s.projectName || s.customTask || "—",
+          projectName: s.projectName || (s.customTask ? "(Custom Task)" : "—"),
+          taskTitle: s.taskTitle || (s.customTask ? s.customTask : null),
+          customTask: s.customTask || null,
           taskType: s.taskType || "—",
           status: s.status,
           totalMinutes: 0,
+          totalMs: 0,
           segments: [],
         });
       }
 
       const g = map.get(key);
-
-      g.totalMinutes += s.totalMinutes || 0;
+      const sessMs = getTodayMs(s, now);
+      g.totalMs += sessMs;
+      g.totalMinutes = g.totalMs / 60000;
 
       if (Array.isArray(s.segments)) {
-        g.segments.push(
-          ...s.segments.filter(seg => seg.start && seg.end)
-        );
+        g.segments.push(...s.segments.filter((seg) => seg.start && seg.end));
       }
 
-      if (s.status === "active") g.status = "active";
+      if (s.status === "active") {
+        g.status = "active";
+      } else if (g.status !== "active" && s.status === "paused") {
+        g.status = "paused";
+      }
     }
 
     return Array.from(map.values());
-  }, [sessions]);
+  }, [sessions, elapsed]);
 
   const filteredGroupedSessions = useMemo(() => {
     // ✅ IF DATE RANGE IS SELECTED, SHOW EVERYTHING RETURNED BY API
@@ -610,17 +954,23 @@ export default function WorkTimer({ auth }) {
     }
 
     const now = new Date();
+    const todayStr = getLocalDateStr(now);
 
-    return groupedSessions.filter(p => {
-      const d = new Date(p.date);
+    return groupedSessions.filter((p) => {
+      if (!p.date) return false;
 
       if (dateFilter === "today") {
-        return d.toDateString() === now.toDateString();
+        return p.date === todayStr;
       }
+
+      const [y, m, day] = p.date.split("-").map(Number);
+      const d = new Date(y, m - 1, day);
 
       if (dateFilter === "week") {
         const startOfWeek = new Date(now);
-        startOfWeek.setDate(now.getDate() - now.getDay());
+        const dayOfWeek = startOfWeek.getDay();
+        const diff = startOfWeek.getDate() - dayOfWeek + (dayOfWeek === 0 ? -6 : 1);
+        startOfWeek.setDate(diff);
         startOfWeek.setHours(0, 0, 0, 0);
         return d >= startOfWeek;
       }
@@ -636,16 +986,16 @@ export default function WorkTimer({ auth }) {
     });
   }, [groupedSessions, dateFilter, range.from, range.to]);
 
-
   function exportCSV(rows) {
     const headers = [
       "Company",
       "Category",
       "Project",
+      "Task",
       "Work Type",
       "Status",
       "Total Minutes",
-      "Total Hours",
+      "Total Time (HH:MM:SS)",
       "Date",
     ];
 
@@ -657,6 +1007,7 @@ export default function WorkTimer({ auth }) {
         p.companyName ?? "—",
         p.categoryName ?? "—",
         p.projectName ?? "—",
+        p.taskTitle ?? "—",
         p.taskType ?? "—",
         p.status ?? "—",
         Math.round(p.totalMinutes || 0),
@@ -664,7 +1015,9 @@ export default function WorkTimer({ auth }) {
         p.date ?? "",
       ];
 
-      lines.push(row.map(v => `"${String(v).replace(/"/g, '""')}"`).join(","));
+      lines.push(
+        row.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(","),
+      );
     }
 
     const csv = lines.join("\n");
@@ -674,15 +1027,15 @@ export default function WorkTimer({ auth }) {
 
     const a = document.createElement("a");
     a.href = url;
-    a.download = range.from && range.to
-      ? `work-logs-${range.from}-to-${range.to}.csv`
-      : `work-logs-${dateFilter}.csv`;
+    a.download =
+      range.from && range.to
+        ? `work-logs-${range.from}-to-${range.to}.csv`
+        : `work-logs-${dateFilter}.csv`;
 
     a.click();
 
     URL.revokeObjectURL(url);
   }
-
 
   const projectSummary = useMemo(() => {
     const map = new Map();
@@ -696,16 +1049,18 @@ export default function WorkTimer({ auth }) {
         map.set(key, {
           projectName: g.projectName,
           taskType: g.taskType,
+          totalMs: 0,
           totalMinutes: 0,
         });
       }
 
-      map.get(key).totalMinutes += g.totalMinutes || 0;
+      const item = map.get(key);
+      item.totalMs += g.totalMs || 0;
+      item.totalMinutes = item.totalMs / 60000;
     }
 
     return Array.from(map.values());
   }, [filteredGroupedSessions]);
-
 
   const projectDailyBreakdown = useMemo(() => {
     const map = new Map();
@@ -713,62 +1068,53 @@ export default function WorkTimer({ auth }) {
     for (const g of filteredGroupedSessions) {
       if (!g.projectName || g.projectName === "—") continue;
 
-      const key = `${g.projectName}|${g.date}`;
+      const key = `${g.projectName}|${g.taskType}|${g.date}`;
 
       if (!map.has(key)) {
         map.set(key, {
           projectName: g.projectName,
+          taskType: g.taskType,
           date: g.date,
+          totalMs: 0,
           totalMinutes: 0,
         });
       }
 
-      map.get(key).totalMinutes += g.totalMinutes || 0;
+      const item = map.get(key);
+      item.totalMs += g.totalMs || 0;
+      item.totalMinutes = item.totalMs / 60000;
     }
 
     return Array.from(map.values());
   }, [filteredGroupedSessions]);
 
-
   // ---- UI ----
   return (
-<div className="mx-auto px-4 py-4 space-y-4">
+    <div className="min-h-screen bg-[#f7f9fc] ">
+      <div className="mx-auto max-w-[1500px] space-y-5">
+        {/* Error */}
 
+        {/* Error */}
+        {error && (
+          <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+            {error}
+          </div>
+        )}
 
-      {/* Page header */}
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          {/* <p className="text-xs text-gray-500 ">
-            Press <span className="font-semibold">S</span> to Start,&nbsp;
-            <span className="font-semibold">P/Space</span> to Pause/Resume,&nbsp;
-            <span className="font-semibold">X</span> to Stop
-          </p> */}
-        </div>
-
-      </div>
-
-      {/* Error */}
-      {error && (
-        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          {error}
-        </div>
-      )}
-
-      {/* ---------------- MODE TOGGLE ---------------- */}
-<div className="flex justify-between items-center border-b pb-2">
-
+        {/* ---------------- MODE TOGGLE ---------------- */}
+      <div className="flex items-center justify-between border-b border-slate-200 pb-2">
   {/* Mode Tabs */}
-  <div className="flex bg-gray-100 rounded-lg p-1">
+  <div className="flex items-center gap-1">
     <button
       onClick={() => {
         setMode("project");
         setCustomTask("");
       }}
-      className={`px-4 py-1.5 text-sm rounded-md font-medium transition
-      ${mode === "project"
-          ? "bg-gradient-to-r from-blue-600 to-blue-700 text-white shadow"
-          : "text-gray-600 hover:bg-white"
-        }`}
+      className={`border-b-2 px-3 py-1.5 text-sm font-semibold transition ${
+        mode === "project"
+          ? "border-blue-600 text-blue-600"
+          : "border-transparent text-slate-500 hover:text-slate-800"
+      }`}
     >
       Project Mode
     </button>
@@ -781,442 +1127,884 @@ export default function WorkTimer({ auth }) {
         setProjectId("");
         setProjects([]);
       }}
-      className={`px-4 py-1.5 text-sm rounded-md font-medium transition
-      ${mode === "custom"
-          ? "bg-gradient-to-r from-blue-600 to-blue-700 text-white shadow"
-          : "text-gray-600 hover:bg-white"
-        }`}
+      className={`border-b-2 px-3 py-1.5 text-sm font-semibold transition ${
+        mode === "custom"
+          ? "border-blue-600 text-blue-600"
+          : "border-transparent text-slate-500 hover:text-slate-800"
+      }`}
     >
-      Custom Task Mode
+      Custom Task
     </button>
   </div>
 
   {/* Refresh */}
   <button
     onClick={loadSessionsAndTick}
-    className="text-sm px-3 py-1.5 rounded-md border border-gray-300 hover:bg-gray-50"
+    className="rounded-md px-2.5 py-1.5 text-sm font-medium text-slate-500 transition hover:bg-slate-100 hover:text-slate-800"
   >
     ↻ Refresh
   </button>
 </div>
 
-
+        {/* ---------------- SELECT CONTEXT (PROJECT MODE ONLY) ---------------- */}
       {/* ---------------- SELECT CONTEXT (PROJECT MODE ONLY) ---------------- */}
       {mode === "project" && (
-       <div className="bg-gray-50/70 border border-gray-200 rounded-lg px-3 py-3">
+        <div className="space-y-4">
+          {/* 🌟 ALL ASSIGNED TASKS QUICK-SELECTOR 🌟 */}
+          {allMyTasks.length > 0 && (
+            <div className="rounded-2xl border border-slate-200/90 bg-white p-4 shadow-xs">
+              <div className="mb-3 flex items-center justify-between">
+                <div className="flex items-center gap-2.5">
+                  <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-blue-50 text-blue-600 border border-blue-100/80">
+                    <ListTodo size={15} />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h3 className="text-sm font-bold text-slate-900">
+                        Your Assigned Tasks
+                      </h3>
+                      <span className="rounded-full bg-blue-50 px-2 py-0.2 text-[11px] font-bold text-blue-700 border border-blue-200/60">
+                        {allMyTasks.length}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-500">
+                      Click any task to select it and auto-fill project details
+                    </p>
+                  </div>
+                </div>
 
+                <button
+                  type="button"
+                  onClick={loadAllMyTasks}
+                  className="flex items-center gap-1.5 text-xs font-semibold text-slate-600 hover:text-blue-600 hover:bg-slate-50 px-2.5 py-1 rounded-lg border border-slate-200 transition cursor-pointer"
+                >
+                  <RotateCw size={12} />
+                  <span>Refresh Tasks</span>
+                </button>
+              </div>
 
-          <div className="mb-3 flex items-center justify-between">
-            <div className="text-sm font-medium text-gray-700">
-              Select Context
+              <div className="grid gap-2.5 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 max-h-64 overflow-y-auto pr-1">
+                {allMyTasks.map((t) => {
+                  const isSelected = selectedTaskId === t._id;
+                  const proj = typeof t.project === "object" ? t.project : null;
+                  const projName = proj?.name || "Assigned Project";
+                  const projCode = proj?.code || "";
+                  const compName = proj?.company?.name || "";
+                  const catName = proj?.category?.name || "";
+                  const details = parseTaskDetails(t);
+
+                  const curProjId = activeSession?.projectId || (typeof activeSession?.project === "object" ? activeSession?.project?._id : activeSession?.project);
+                  const curTaskId = activeSession?.taskId || (typeof activeSession?.task === "object" ? activeSession?.task?._id : activeSession?.task);
+                  const isActiveTask = activeSession?.status === "active" && (curTaskId === t._id || (!curTaskId && curProjId === proj?._id));
+                  const isPausedTask = activeSession?.status === "paused" && (curTaskId === t._id || (!curTaskId && curProjId === proj?._id));
+
+                  return (
+                    <div
+                      key={t._id}
+                      onClick={() => selectAssignedTask(t)}
+                      className={`group cursor-pointer text-left rounded-xl border p-3 transition-all duration-150 flex flex-col justify-between gap-2 ${
+                        isActiveTask
+                          ? "border-emerald-500 bg-emerald-50/50 shadow-xs ring-2 ring-emerald-200"
+                          : isPausedTask
+                          ? "border-amber-400 bg-amber-50/40 shadow-xs ring-2 ring-amber-200"
+                          : isSelected
+                          ? "border-blue-500 bg-blue-50/50 shadow-xs ring-2 ring-blue-200"
+                          : "border-slate-200 bg-slate-50/40 hover:border-blue-300 hover:bg-white shadow-2xs"
+                      }`}
+                    >
+                      {/* TOP ROW: PROJECT NAME & CODE & TYPE */}
+                      <div className="flex items-start justify-between gap-2 w-full">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <FolderKanban size={15} className="text-blue-600 shrink-0" />
+                          <span className="text-xs font-bold text-slate-900 truncate" title={projName}>
+                            {projName}
+                          </span>
+                          {projCode && (
+                            <span className="rounded bg-slate-200/70 px-1.5 py-0.2 text-[10px] font-semibold text-slate-700 shrink-0">
+                              {projCode}
+                            </span>
+                          )}
+                        </div>
+                        <span className="shrink-0 rounded-md bg-blue-50 border border-blue-200/70 px-1.5 py-0.2 text-[10px] font-bold text-blue-700 uppercase tracking-wide">
+                          {t.taskType || "Task"}
+                        </span>
+                      </div>
+
+                      {/* MIDDLE ROW: Phase Name & Task Title */}
+                      <div className="space-y-1">
+                        {details.phase && (
+                          <div className="flex items-center gap-1">
+                            <span className="rounded bg-slate-100 border border-slate-200 px-1.5 py-0.2 text-[10px] font-semibold text-slate-700 truncate max-w-full">
+                              📌 {details.phase}
+                            </span>
+                          </div>
+                        )}
+                        <div className="text-xs font-semibold text-slate-800 line-clamp-1" title={t.title}>
+                          {t.title}
+                        </div>
+                        {details.deliverable && (
+                          <div className="text-[10px] text-slate-400 truncate">
+                            Deliverable: {details.deliverable}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* BOTTOM ROW: Company/Category & Status Action */}
+                      <div className="flex items-center justify-between border-t border-slate-100 pt-2 text-[10px] text-slate-400 w-full">
+                        <span className="truncate max-w-[130px]" title={compName ? `${compName}${catName ? ` · ${catName}` : ""}` : ""}>
+                          {compName ? `${compName}${catName ? ` · ${catName}` : ""}` : "—"}
+                        </span>
+
+                        <div className="flex items-center gap-1">
+                          {isActiveTask ? (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.2 text-[10px] font-bold text-emerald-800 animate-pulse">
+                              ● Running
+                            </span>
+                          ) : isPausedTask ? (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                selectAssignedTask(t);
+                                resume();
+                              }}
+                              className="inline-flex items-center gap-1 rounded-full bg-amber-100 hover:bg-amber-200 px-2 py-0.2 text-[10px] font-bold text-amber-800 transition"
+                            >
+                              ❚❚ Resume
+                            </button>
+                          ) : isSelected ? (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-blue-600 px-2 py-0.2 text-[10px] font-bold text-white">
+                              Selected ✓
+                            </span>
+                          ) : (
+                            <span className="font-semibold text-blue-600 group-hover:text-blue-800 text-[11px]">
+                              Pick Task →
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
-            <div className="text-xs text-gray-500">
-              {projects.length ? `${projects.length} project(s)` : "No projects"}
-            </div>
-          </div>
+          )}
 
-          <div className="grid gap-3 sm:grid-cols-4">
-            {/* Company */}
-            <div className="flex flex-col gap-1">
-              <label className="text-xs text-gray-500">Company</label>
-              <select
-                value={companyId}
-                onChange={(e) => {
-                  setCompanyId(e.target.value);
-                  setCategoryId("");
-                  setProjectId("");
-                  setProjects([]);
-                }}
-                className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500"
-              >
-                <option value="">Select company</option>
-                {companies.map((c) => (
-                  <option key={c._id} value={c._id}>{c.name}</option>
-                ))}
-              </select>
+          {/* Project & Category Dropdowns */}
+          <div className="rounded-3xl border border-slate-200 bg-gradient-to-br from-white to-slate-50 p-5 shadow-[0_14px_40px_rgba(15,23,42,0.08)]">
+            <div className="mb-5 flex items-center justify-between">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900">
+                  Project Work Details
+                </h3>
+                <p className="mt-0.5 text-xs text-slate-500">
+                  Select company, category, and project
+                </p>
+              </div>
+
+              <span className="rounded-full border border-blue-100 bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700">
+                {projects.length ? `${projects.length} Projects` : "No Projects"}
+              </span>
             </div>
 
-            {/* Category */}
-            <div className="flex flex-col gap-1">
-              <label className="text-xs text-gray-500">Category</label>
-              <select
-                value={categoryId}
-                onChange={(e) => {
-                  setCategoryId(e.target.value);
-                  setProjectId("");
-                }}
-                className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500"
-                disabled={!companyId}
-              >
-                <option value="">Select category</option>
-                {categories.map((g) => (
-                  <option key={g._id} value={g._id}>{g.name}</option>
-                ))}
-              </select>
-            </div>
+            <div className="grid gap-4 md:grid-cols-4">
+              {[
+                {
+                  label: "Company",
+                  value: companyId,
+                  disabled: false,
+                  options: companies,
+                  placeholder: "Select company",
+                  onChange: (value) => {
+                    setCompanyId(value);
+                    setCategoryId("");
+                    setProjectId("");
+                    setProjects([]);
+                    setSelectedTaskId("");
+                  },
+                },
+                {
+                  label: "Category",
+                  value: categoryId,
+                  disabled: !companyId,
+                  options: categories,
+                  placeholder: "Select category",
+                  onChange: (value) => {
+                    setCategoryId(value);
+                    setProjectId("");
+                    setSelectedTaskId("");
+                  },
+                },
+                {
+                  label: "Project",
+                  value: projectId,
+                  disabled: !companyId || !categoryId || !projects.length,
+                  options: projects,
+                  placeholder: "Select project",
+                  onChange: (value) => {
+                    setProjectId(value);
+                    if (value) localStorage.setItem("lastProjectId", value);
+                    setSelectedTaskId("");
+                  },
+                },
+              ].map((field) => (
+                <div key={field.label} className="flex flex-col gap-1.5">
+                  <label className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    {field.label}
+                  </label>
 
-            {/* Project */}
-            <div className="flex flex-col gap-1">
-              <label className="text-xs text-gray-500">Project</label>
-              <select
-                value={projectId}
-                onChange={(e) => setProjectId(e.target.value)}
-                className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500"
-                disabled={!companyId || !categoryId || !projects.length}
-              >
-                <option value="">Select project</option>
-                {projects.map((p) => (
-                  <option key={p._id} value={p._id}>{p.name}</option>
-                ))}
-              </select>
-            </div>
+                  <select
+                    value={field.value}
+                    disabled={field.disabled}
+                    onChange={(e) => field.onChange(e.target.value)}
+                    className="h-11 rounded-2xl border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 shadow-sm outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
+                  >
+                    <option value="">{field.placeholder}</option>
+                    {field.options.map((item) => (
+                      <option key={item._id} value={item._id}>
+                        {item.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ))}
 
-            {/* Work Type */}
-            <div className="flex flex-col gap-1">
-              <label className="text-xs text-gray-500">Work Type</label>
-              <select
-                value={workType}
-                onChange={(e) => setWorkType(e.target.value)}
-                className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500"
-                disabled={!projectId}
-              >
-                {workTypes.map((wt) => (
-                  <option key={wt} value={wt}>
-                    {wt}
-                  </option>
-                ))}
-              </select>
+              <div className="flex flex-col gap-1.5">
+                <label className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                  Work Type
+                </label>
+
+                <select
+                  value={workType}
+                  onChange={(e) => setWorkType(e.target.value)}
+                  disabled={!projectId}
+                  className="h-11 rounded-2xl border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 shadow-sm outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
+                >
+                  {workTypes.map((wt) => (
+                    <option key={wt} value={wt}>
+                      {wt}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* ── Task dropdown for the chosen project ── */}
+              {assignedTasks.length > 0 && (
+                <div className="flex flex-col gap-1.5 md:col-span-4">
+                  <label className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    Tasks for this Project
+                    <span className="ml-1.5 rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] font-bold text-blue-700">
+                      {assignedTasks.length}
+                    </span>
+                  </label>
+
+                  <select
+                    value={selectedTaskId}
+                    disabled={!projectId}
+                    onChange={(e) => {
+                      const tid = e.target.value;
+                      setSelectedTaskId(tid);
+                      if (tid) {
+                        const task = assignedTasks.find((t) => t._id === tid);
+                        if (task?.taskType) setWorkType(task.taskType);
+                      }
+                    }}
+                    className="h-11 rounded-2xl border border-blue-200 bg-blue-50/50 px-4 text-sm font-medium text-slate-700 shadow-sm outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
+                  >
+                    <option value="">Select task (optional)</option>
+                    {assignedTasks.map((t) => (
+                      <option key={t._id} value={t._id}>
+                        {t.isMyTask ? "★ " : ""}{t.title} — {t.taskType} {t.isMyTask ? "(Assigned to you)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
             </div>
           </div>
         </div>
       )}
 
-      {/* ---------------- CUSTOM TASK MODE ---------------- */}
-      {mode === "custom" && (
-        <div className="mt-4">
-          <label className="text-xs text-gray-500">Custom Task</label>
-          <input
-            type="text"
-            value={customTask}
-            onChange={(e) => setCustomTask(e.target.value)}
-            placeholder="Enter custom task"
-            className="mt-1 w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm outline-none focus:border-blue-500"
-          />
-        </div>
-      )}
+{mode === "custom" && (
+  <div className="rounded-3xl border border-slate-200 bg-gradient-to-br from-white to-slate-50 p-5 shadow-[0_14px_40px_rgba(15,23,42,0.08)]">
+    <div className="mb-5">
+      <h3 className="text-sm font-bold text-slate-900">
+        Custom Task Details
+      </h3>
+      <p className="mt-0.5 text-xs text-slate-500">
+        Add your custom work manually
+      </p>
+    </div>
 
-      {/* ---------------- Stopwatch + Controls ---------------- */}
-   <div className="bg-white border border-gray-200 rounded-lg px-5 py-4 shadow-[0_1px_0_rgba(0,0,0,0.03)]">
+    <div className="grid gap-4 md:grid-cols-2">
+      <div className="flex flex-col gap-1.5">
+        <label className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+          Custom Task
+        </label>
 
-        <div className="grid gap-4 sm:grid-cols-[1fr_auto_1fr] sm:items-center">
+        <input
+          type="text"
+          value={customTask}
+          onChange={(e) => setCustomTask(e.target.value)}
+          placeholder="e.g. Team meeting, code review"
+          className="h-11 rounded-2xl border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 shadow-sm outline-none transition placeholder:text-slate-400 focus:border-blue-500 focus:ring-4 focus:ring-blue-100"
+        />
+      </div>
 
-          {/* Left side */}
-          <div className="text-center sm:text-left">
-            <div className="text-xs uppercase tracking-wide text-gray-500">
-              Current
-            </div>
-            <div className="text-gray-900 font-medium">
-              {anyCurrent
-                ? activeSession.projectName ||
-                activeSession.project?.name ||
-                activeSession.customTask ||
-                "Unknown"
-                : "No active session"}
-            </div>
+      <div className="flex flex-col gap-1.5">
+        <label className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+          Work Type
+        </label>
 
-            <div className="mt-1 text-xs text-gray-500">
-              Today total:
-              <span className="font-semibold"> {formatTime(todaysTotalMs)}</span>
-            </div>
-          </div>
+        <select
+          value={workType}
+          onChange={(e) => setWorkType(e.target.value)}
+          className="h-11 rounded-2xl border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 shadow-sm outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100"
+        >
+          {workTypes.map((wt) => (
+            <option key={wt} value={wt}>
+              {wt}
+            </option>
+          ))}
+        </select>
+      </div>
+    </div>
+  </div>
+)}
 
-          {/* Timer center */}
-          <div className="flex items-center justify-center">
-            <div className="relative">
-              <div
-                className={`absolute inset-0 rounded-xl blur-md transition ${hasRunning ? "bg-blue-200/60" : "bg-gray-200/40"
-                  }`}
-              />
-              <div className="relative rounded-xl px-4 py-2 font-mono text-4xl sm:text-5xl font-semibold tracking-tight text-blue-700">
-                {formatTime(elapsed)}
+        {/* ---------------- Premium Timer + Today Summary ---------------- */}
+        <div className="grid gap-4 lg:grid-cols-[1.4fr_0.8fr]">
+          {/* Timer Card */}
+          <div className="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm">
+            <div className="flex flex-col gap-5 md:flex-row md:items-center md:justify-between">
+              <div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="text-[11px] font-bold uppercase tracking-[0.18em] text-gray-400">
+                    Current Session
+                  </p>
+
+                  {hasRunning && (
+                    <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700">
+                      ● Running
+                    </span>
+                  )}
+
+                  {hasPaused && (
+                    <span className="rounded-full bg-amber-50 px-2.5 py-1 text-xs font-semibold text-amber-700">
+                      Paused
+                    </span>
+                  )}
+
+                  {isOffline && (
+                    <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 border border-amber-300 px-2.5 py-1 text-xs font-semibold text-amber-800 animate-pulse">
+                      <WifiOff size={13} className="text-amber-600" />
+                      Offline (Tracking Locally)
+                    </span>
+                  )}
+
+                  {isSyncing && (
+                    <span className="inline-flex items-center gap-1.5 rounded-full bg-blue-50 border border-blue-200 px-2.5 py-1 text-xs font-semibold text-blue-700">
+                      <RefreshCw size={13} className="animate-spin text-blue-600" />
+                      Syncing…
+                    </span>
+                  )}
+                </div>
+
+                <h2 className="mt-2 max-w-[420px] truncate text-lg font-semibold text-gray-900" title={
+                  anyCurrent
+                    ? (activeSession.customTask || activeSession.projectName || activeSession.project?.name || "No Project")
+                    : (mode === "project" && selectedProj ? selectedProj.name : "No active session")
+                }>
+                  {anyCurrent
+                    ? (activeSession.customTask || activeSession.projectName || activeSession.project?.name || "No Project")
+                    : (mode === "project" && selectedProj ? selectedProj.name : "No active session")}
+                </h2>
+
+                {/* Show context switch badge if a different project is selected */}
+                {anyCurrent && !isSameContext && selectedProj && (
+                  <div className="mt-1.5 inline-flex items-center gap-1.5 rounded-xl border border-blue-200 bg-blue-50 px-2.5 py-1 text-xs text-blue-900 font-medium">
+                    <span className="text-blue-600">Selected to switch:</span>
+                    <strong className="font-bold text-blue-950">{selectedProj.name}</strong>
+                  </div>
+                )}
+
+                <div className="mt-4 font-mono text-5xl font-bold tracking-tight text-gray-950">
+                  {formatTime(elapsed)}
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3 md:flex-col md:items-stretch">
+                {/* 1. FIRST BUTTON: Start Session (idle) / Pause (running) / Resume (paused) */}
+                {hasRunning ? (
+                  <button
+                    onClick={pause}
+                    className="group inline-flex items-center justify-center gap-3 rounded-full border-2 border-orange-500 bg-white px-8 py-3 text-sm font-semibold text-slate-800 shadow-[0_6px_18px_rgba(249,115,22,0.16)] transition-all duration-200 hover:bg-orange-50 hover:shadow-[0_8px_24px_rgba(249,115,22,0.24)] active:scale-[0.98]"
+                  >
+                    <span className="text-2xl font-bold leading-none text-orange-500">
+                      ❚❚
+                    </span>
+                    Pause
+                  </button>
+                ) : hasPaused ? (
+                  <button
+                    id="work-timer-start-btn"
+                    onClick={resume}
+                    className="group inline-flex items-center justify-center gap-3 rounded-full border-2 border-green-600 bg-white px-8 py-3 text-sm font-semibold text-slate-800 shadow-[0_6px_18px_rgba(22,163,74,0.14)] transition-all duration-200 hover:bg-green-50 hover:shadow-[0_8px_24px_rgba(22,163,74,0.22)] active:scale-[0.98]"
+                  >
+                    <span className="inline-flex items-center text-green-600">
+                      <svg
+                        className="h-5 w-5 fill-green-600"
+                        viewBox="0 0 24 24"
+                      >
+                        <path d="M8 5v14l11-7z" />
+                      </svg>
+                    </span>
+                    Resume
+                  </button>
+                ) : (
+                  <button
+                    id="work-timer-start-btn"
+                    onClick={start}
+                    disabled={
+                      (mode === "project" && (!projectId || !workType)) ||
+                      (mode === "custom" && !customTask.trim())
+                    }
+                    className="inline-flex items-center justify-center gap-3 rounded-full border-2 border-green-600 bg-white px-8 py-3 text-sm font-semibold text-slate-800 shadow-[0_6px_18px_rgba(22,163,74,0.14)] transition-all duration-200 hover:bg-green-50 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-45"
+                  >
+                    <span className="inline-flex items-center text-green-600">
+                      <svg
+                        className="h-5 w-5 fill-green-600"
+                        viewBox="0 0 24 24"
+                      >
+                        <path d="M8 5v14l11-7z" />
+                      </svg>
+                    </span>
+                    Start Session
+                  </button>
+                )}
+
+                {/* 2. SECOND BUTTON: Stop Session */}
+                <button
+                  onClick={stop}
+                  disabled={!anyCurrent}
+                  className="inline-flex items-center justify-center gap-3 rounded-full border-2 border-red-500 bg-white px-8 py-3 text-sm font-semibold text-slate-800 shadow-[0_6px_18px_rgba(239,68,68,0.14)] transition-all duration-200 hover:bg-red-50 hover:shadow-[0_8px_24px_rgba(239,68,68,0.22)] active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-45"
+                >
+                  <span className="grid h-7 w-7 place-items-center rounded-full border-2 border-red-500 text-red-500">
+                    ■
+                  </span>
+                  Stop Session
+                </button>
               </div>
             </div>
           </div>
 
-          {/* Controls */}
-          <div className="flex flex-wrap items-center justify-center sm:justify-end gap-2">
-            <button
-              onClick={start}
-              className="rounded-lg bg-green-600 text-white px-3 py-2 text-sm font-medium hover:bg-green-700 disabled:opacity-40"
-              disabled={
-                (mode === "project" && (!projectId || !workType)) ||
-                (mode === "custom" && !customTask.trim()) ||
-                anyCurrent
-              }
-            >
-              ▶ Start
-            </button>
+          {/* Today Summary Card */}
+          <div className="rounded-3xl border border-gray-200 bg-gradient-to-br from-blue-50 to-white p-5 shadow-sm">
+            <p className="text-[11px] font-bold uppercase tracking-[0.18em] text-gray-400">
+              Today Total
+            </p>
 
-            <button
-              onClick={pause}
-              className="rounded-lg bg-yellow-500 text-white px-3 py-2 text-sm font-medium hover:bg-yellow-600 disabled:opacity-40"
-              disabled={!hasRunning}
-            >
-              ❚❚ Pause
-            </button>
+            <div className="mt-4 font-mono text-4xl font-bold text-blue-700">
+              {formatTime(todaysTotalMs)}
+            </div>
 
-            <button
-              onClick={resume}
-              className="rounded-lg bg-blue-600 text-white px-3 py-2 text-sm font-medium hover:bg-blue-700 disabled:opacity-40"
-              disabled={!hasPaused}
-            >
-              ► Resume
-            </button>
+            <div className="mt-5 grid grid-cols-2 gap-3 text-sm">
+              <div className="rounded-2xl bg-white p-3 shadow-sm">
+                <p className="text-xs text-gray-500">Status</p>
+                <p className="mt-1 font-semibold text-gray-900">
+                  {hasRunning ? "Working" : hasPaused ? "Paused" : "Idle"}
+                </p>
+              </div>
 
-            <button
-              onClick={stop}
-              className="rounded-lg bg-red-600 text-white px-3 py-2 text-sm font-medium hover:bg-red-700 disabled:opacity-40"
-              disabled={!anyCurrent}
-            >
-              ◼ Stop
-            </button>
+              <div className="rounded-2xl bg-white p-3 shadow-sm">
+                <p className="text-xs text-gray-500">Sessions</p>
+                <p className="mt-1 font-semibold text-gray-900">
+                  {todaysSessionsCount}
+                </p>
+              </div>
+            </div>
           </div>
         </div>
+
+        {/* Sessions table (unchanged) */}
+   <div className="rounded-3xl border border-slate-200 bg-white shadow-[0_18px_50px_rgba(15,23,42,0.08)] min-h-[580px] flex flex-col">
+  <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-100 bg-gradient-to-r from-slate-50 to-white px-6 py-5 rounded-t-3xl">
+    <div>
+      <p className="text-xs font-bold uppercase tracking-[0.18em] text-blue-600">
+        Work Overview
+      </p>
+
+      <h3 className="mt-1 text-xl font-extrabold text-slate-900">
+        {range.from && range.to
+          ? "Custom Date Range"
+          : dateFilter === "today"
+            ? "Today’s Work Sessions"
+            : dateFilter === "week"
+              ? "This Week’s Work Sessions"
+              : "This Month’s Work Sessions"}
+      </h3>
+    </div>
+
+    {loading && (
+      <span className="rounded-full bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-600 animate-pulse">
+        Loading…
+      </span>
+    )}
+  </div>
+
+  <div className="mt-1">
+    <div className="flex flex-wrap items-center justify-between gap-4 px-6 py-4">
+      {/* Left Section: Date Range Picker + Date Filter Buttons */}
+      <div className="flex flex-wrap items-center gap-2 relative z-30">
+        <DateRangePicker
+          from={range.from}
+          to={range.to}
+          onChange={(r) => {
+            setRange(r); // Save selected dates and reload sessions
+          }}
+        />
+
+        {["today", "week", "month"].map((f) => (
+          <button
+            key={f}
+            onClick={() => {
+              setRange({ from: null, to: null }); // Clear custom range
+              setDateFilter(f);
+            }}
+            className={`rounded-full px-4 py-2 text-xs font-bold transition-all ${
+              dateFilter === f
+                ? "bg-slate-900 text-white shadow-md"
+                : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+            }`}
+          >
+            {f.toUpperCase()}
+          </button>
+        ))}
       </div>
 
-      {/* Sessions table (unchanged) */}
-      <div className="rounded-xl border border-gray-200 bg-white p-0 shadow-sm">
-        <div className="flex items-center justify-between px-4 pt-4">
-          <h3 className="text-lg font-semibold">
-            {range.from && range.to
-              ? "Custom Date Range"
-              : dateFilter === "today"
-                ? "Today’s Work Sessions"
-                : dateFilter === "week"
-                  ? "This Week’s Work Sessions"
-                  : "This Month’s Work Sessions"}
-          </h3>
-          {loading && (
-            <span className="text-xs text-gray-500 animate-pulse">
-              Loading…
-            </span>
-          )}
+      {/* Right Section: View Toggle + Export Button */}
+      <div className="flex flex-wrap items-center gap-2">
+        {/* View Toggle Buttons */}
+        <div className="flex items-center gap-1 rounded-full bg-slate-100 p-1">
+          <button
+            onClick={() => setView("work")}
+            className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
+              view === "work"
+                ? "bg-white text-slate-900 shadow-sm"
+                : "text-slate-500 hover:text-slate-800"
+            }`}
+          >
+            Work Sessions
+          </button>
+
+          <button
+            onClick={() => setView("project")}
+            className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
+              view === "project"
+                ? "bg-white text-slate-900 shadow-sm"
+                : "text-slate-500 hover:text-slate-800"
+            }`}
+          >
+            Project
+          </button>
         </div>
 
-        <div className="mt-3">
-          <div className="flex items-center justify-between px-4 pt-2">
-            {/* Left Section: Date Range Picker + Date Filter Buttons */}
-            <div className="flex items-center gap-2">
-              <DateRangePicker
-                from={range.from}
-                to={range.to}
-                onChange={(r) => {
-                  setRange(r); // Save selected dates and reload sessions
-                }}
-              />
+        {/* Export CSV Button */}
+        <button
+          onClick={() => exportCSV(filteredGroupedSessions)}
+          className="rounded-full bg-blue-600 px-4 py-2 text-sm font-bold text-white shadow-sm transition hover:bg-blue-700"
+        >
+          ⬇ Export CSV
+        </button>
+      </div>
+    </div>
 
-              {["today", "week", "month"].map((f) => (
-                <button
-                  key={f}
-                  onClick={() => {
-                    setRange({ from: null, to: null }); // Clear custom range
-                    setDateFilter(f);
-                  }}
-                  className={`px-3 py-1 text-xs font-medium rounded 
-          ${dateFilter === f ? "bg-blue-600 text-white" : "bg-gray-200 text-gray-700"}`}
-                >
-                  {f.toUpperCase()}
-                </button>
-              ))}
-            </div>
+    {/* 🔹 VIEW TOGGLE */}
 
-            {/* Right Section: View Toggle + Export Button */}
-            <div className="flex items-center gap-2">
-              {/* View Toggle Buttons */}
-              <button
-                onClick={() => setView("work")}
-                className={`px-4 py-2 rounded-sm text-sm font-medium 
-        ${view === "work" ? "bg-blue-600 text-white" : "bg-gray-200 text-gray-700"}`}
-              >
-                Work Sessions
-              </button>
+    {view === "work" && (
+      <div className="border-t border-slate-100 bg-slate-50/60 p-4 flex-1 flex flex-col rounded-b-3xl">
+        <div className="flex-1 max-h-[56vh] min-h-[360px] overflow-auto rounded-2xl border border-slate-200 bg-white shadow-sm flex flex-col">
+          <table className="w-full text-sm table-fixed border-separate border-spacing-0 flex-1">
+            <thead className="sticky top-0 z-20 bg-white border-b border-gray-200 text-xs font-bold uppercase tracking-wider text-slate-500">
+              <tr>
+                <th className="px-4 py-3 text-left w-[130px] sm:w-[150px]">
+                  Company / Category
+                </th>
+                <th className="px-4 py-3 text-left w-[220px] sm:w-[260px]">
+                  Project & Task
+                </th>
+                <th className="px-4 py-3 text-left w-[90px] sm:w-[100px]">
+                  Work Type
+                </th>
+                <th className="px-4 py-3 text-left w-[100px] sm:w-[110px]">
+                  Status
+                </th>
+                <th className="px-4 py-3 text-left w-[110px] sm:w-[120px]">
+                  Total Time
+                </th>
+                <th className="px-4 py-3 text-left w-[90px] sm:w-[100px]">
+                  Date
+                </th>
+                <th className="px-4 py-3 text-left w-[90px] sm:w-[100px]">
+                  Logs
+                </th>
+              </tr>
+            </thead>
 
-              <button
-                onClick={() => setView("project")}
-                className={`px-4 py-2 rounded-sm text-sm font-medium 
-        ${view === "project" ? "bg-blue-600 text-white" : "bg-gray-200 text-gray-700"}`}
-              >
-                Project
-              </button>
+            <tbody className="[&_tr]:border-t">
+              {(!filteredGroupedSessions || filteredGroupedSessions.length === 0) && (
+                <tr>
+                  <td colSpan={7} className="px-4 py-24 text-center">
+                    <div className="inline-flex flex-col items-center gap-2 text-gray-500">
+                      <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-blue-50 text-2xl shadow-xs">
+                        🗓️
+                      </div>
+                      <span className="text-base font-bold text-slate-800">No sessions found for this period</span>
+                      <span className="text-xs text-slate-400 max-w-sm">
+                        Choose a date range using the picker above or start a session to see your activity logs here.
+                      </span>
+                    </div>
+                  </td>
+                </tr>
+              )}
 
-              {/* Export CSV Button */}
-              <button
-                onClick={() => exportCSV(filteredGroupedSessions)}
-                className="rounded-lg border border-gray-300 bg-white px-4 py-1.5 text-sm hover:bg-gray-50"
-              >
-                ⬇ Export CSV
-              </button>
-            </div>
-          </div>
+              {filteredGroupedSessions.map((p) => {
+                const isRowActive = p.status === "active";
+                const isRowPaused = p.status === "paused";
 
-
-          {/* 🔹 VIEW TOGGLE */}
-
-
-          {view === "work" && (
-            <div className="mt-3 max-h-[52vh] overflow-auto border-t">
-              <table className="w-full text-sm table-fixed border-separate border-spacing-0">
-                <thead className="sticky top-0 z-20 bg-white border-b border-gray-200">
-                  <tr>
-                    <th className="px-4 py-3 text-left w-[120px] sm:w-[140px]">Company</th>
-                    <th className="px-4 py-3 text-left w-[100px] sm:w-[120px]">Category</th>
-                    <th className="px-4 py-3 text-left w-[200px] sm:w-[260px]">Project</th>
-                    <th className="px-4 py-3 text-left w-[120px] sm:w-[140px]">Work Type</th>
-                    <th className="px-4 py-3 text-left w-[100px] sm:w-[110px]">Status</th>
-                    <th className="px-4 py-3 text-left w-[120px] sm:w-[140px]">Elapsed</th>
-                    <th className="px-4 py-3 text-left w-[100px] sm:w-[120px]">Total</th>
-                    <th className="px-4 py-3 text-left w-[100px] sm:w-[120px]">Date</th>
-                    <th className="px-4 py-3 text-left w-[110px] sm:w-[120px]">Logs</th>
-                  </tr>
-                </thead>
-
-                <tbody className="[&_tr]:border-t">
-                  {(!sessions || sessions.length === 0) && (
-                    <tr>
-                      <td colSpan={9} className="px-4 py-10 text-center">
-                        <div className="inline-flex flex-col items-center gap-1 text-gray-500">
-                          <span className="text-2xl">🗓️</span>
-                          <span>No sessions yet today</span>
-                          <span className="text-xs">Start a session to see it here.</span>
+                return (
+                  <React.Fragment key={p.key}>
+                    <tr className={`transition ${
+                      isRowActive 
+                        ? "bg-emerald-50/40 hover:bg-emerald-50/70" 
+                        : isRowPaused 
+                        ? "bg-amber-50/30 hover:bg-amber-50/50" 
+                        : "even:bg-gray-50/60 hover:bg-blue-50/40"
+                    }`}>
+                      {/* Company & Category */}
+                      <td className="px-4 py-3">
+                        <div className="font-medium text-slate-800 truncate" title={p.companyName}>
+                          {p.companyName}
+                        </div>
+                        <div className="text-[11px] text-slate-400 truncate" title={p.categoryName}>
+                          {p.categoryName}
                         </div>
                       </td>
-                    </tr>
-                  )}
 
-                  {filteredGroupedSessions.map((p) => (
-                    <React.Fragment key={p.key}>
-                      <tr className="even:bg-gray-50/60">
-                        <td className="px-4 py-3">{p.companyName}</td>
-                        <td className="px-4 py-3">{p.categoryName}</td>
-                        <td className="px-4 py-3 font-medium truncate" title={p.projectName}>
+                      {/* Project & Task Title */}
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="text-sm shrink-0">{p.customTask ? "💼" : "📁"}</span>
+                          <span className="font-bold text-slate-900 truncate" title={p.projectName || p.customTask}>
+                            {p.projectName || p.customTask || "—"}
+                          </span>
+                          {p.customTask && (
+                            <span className="shrink-0 inline-flex items-center rounded-full bg-purple-50 border border-purple-200 px-1.5 py-0.2 text-[9px] font-bold text-purple-700">
+                              Custom
+                            </span>
+                          )}
+                        </div>
+                        {p.taskTitle && p.taskTitle !== (p.projectName || p.customTask) && (
+                          <div className="mt-0.5 inline-flex items-center gap-1 rounded bg-blue-50 border border-blue-100 px-1.5 py-0.5 text-[10px] font-semibold text-blue-700 truncate max-w-full" title={p.taskTitle}>
+                            <span>🎯</span>
+                            <span className="truncate">{p.taskTitle}</span>
+                          </div>
+                        )}
+                      </td>
+
+                      {/* Work Type */}
+                      <td className="px-4 py-3">
+                        <span className="inline-flex items-center rounded-md bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-700">
+                          {p.taskType}
+                        </span>
+                      </td>
+
+                      {/* Status */}
+                      <td className="px-4 py-3">
+                        {isRowActive ? (
+                          <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-100 px-2.5 py-1 text-[11px] font-bold text-emerald-800 animate-pulse shadow-xs">
+                            <span className="h-1.5 w-1.5 rounded-full bg-emerald-600"></span>
+                            Running
+                          </span>
+                        ) : isRowPaused ? (
+                          <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2.5 py-1 text-[11px] font-bold text-amber-800 shadow-xs">
+                            ❚❚ Paused
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-medium text-slate-600">
+                            ✓ Stopped
+                          </span>
+                        )}
+                      </td>
+
+                      {/* Live Total Time */}
+                      <td className="px-4 py-3">
+                        <div className={`font-mono text-sm font-bold tracking-tight ${
+                          isRowActive ? "text-emerald-700" : "text-slate-900"
+                        }`}>
+                          {minutesToHHMM(p.totalMinutes)}
+                        </div>
+                        <div className="text-[10px] text-slate-400">
+                          {Math.round(p.totalMinutes || 0)}m total
+                        </div>
+                      </td>
+
+                      {/* Date */}
+                      <td className="px-4 py-3 text-xs text-slate-600">{p.date}</td>
+
+                      {/* Logs */}
+                      <td className="px-4 py-3">
+                        {p.segments.length > 0 && (
+                          <button
+                            onClick={() =>
+                              setExpanded((prev) => ({
+                                ...prev,
+                                [p.key]: !prev[p.key],
+                              }))
+                            }
+                            className="rounded-full bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-600 transition hover:bg-blue-100"
+                          >
+                            {expanded[p.key]
+                              ? "Hide"
+                              : `Logs (${p.segments.length})`}
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+
+                    {/* Logs Details */}
+                    {expanded[p.key] && (
+                      <tr className="bg-slate-50">
+                        <td colSpan={7} className="px-6 py-3">
+                          <div className="text-xs font-semibold text-gray-600 mb-1">
+                            Time Logs for {p.projectName}
+                          </div>
+                          <ul className="space-y-1 text-xs font-mono text-gray-700">
+                            {p.segments.map((seg, i) => (
+                              <li key={i}>
+                                • {new Date(seg.start).toLocaleTimeString()} →{" "}
+                                {seg.end ? new Date(seg.end).toLocaleTimeString() : "Running now..."}
+                              </li>
+                            ))}
+                          </ul>
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    )}
+
+    {view === "project" && (
+      <div className="border-t border-slate-100 bg-slate-50/60 p-4 flex-1 flex flex-col rounded-b-3xl">
+        <div className="flex-1 min-h-[360px] rounded-2xl border border-slate-200 bg-white p-5 shadow-sm flex flex-col">
+          <h3 className="text-lg font-bold text-slate-900 mb-3">
+            Project – Work Summary
+          </h3>
+
+          {projectSummary.length === 0 ? (
+            <div className="flex-1 flex items-center justify-center py-20 text-center">
+              <div className="inline-flex flex-col items-center gap-2 text-gray-500">
+                <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-blue-50 text-2xl shadow-xs">
+                  📁
+                </div>
+                <span className="text-base font-bold text-slate-800">No project work found</span>
+                <span className="text-xs text-slate-400">
+                  Logged project sessions will be summarized here once completed.
+                </span>
+              </div>
+            </div>
+          ) : (
+            <table className="w-full text-sm table-fixed border-collapse">
+              <thead className="bg-slate-50">
+                <tr>
+                  <th className="px-3 py-2 text-left">Project</th>
+                  <th className="px-3 py-2 text-left">Work Type</th>
+                  <th className="px-3 py-2 text-left">Total Hours</th>
+                  <th className="px-3 py-2 text-left">Details</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                {projectSummary.map((p) => {
+                  const rowKey = `${p.projectName}|${p.taskType}`;
+                  const isExpanded = expandedProject === rowKey;
+
+                  return (
+                    <React.Fragment key={rowKey}>
+                      <tr className="border-t hover:bg-blue-50/40 transition">
+                        <td className="px-3 py-2 font-medium">
                           {p.projectName}
                         </td>
-                        <td className="px-4 py-3">{p.taskType}</td>
-                        <td className="px-4 py-3">
-                          <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs
-                  ${p.status === "active" ? "bg-blue-100 text-blue-700" : "bg-gray-100 text-gray-700"}`}>
-                            {p.status}
-                          </span>
+                        <td className="px-3 py-2">{p.taskType}</td>
+                        <td className="px-3 py-2 font-semibold text-slate-900">
+                          {minutesToHHMM(p.totalMinutes)}
                         </td>
-                        <td className="px-4 py-3 font-mono text-blue-700">
-                          {formatTime(p.totalMinutes * 60000)}
-                        </td>
-                        <td className="px-4 py-3">{minutesToHHMM(p.totalMinutes)}</td>
-                        <td className="px-4 py-3">{p.date}</td>
-                        <td className="px-4 py-3">
-                          {p.segments.length > 0 && (
-                            <button
-                              onClick={() => setExpanded(prev => ({ ...prev, [p.key]: !prev[p.key] }))}
-                              className="text-xs text-blue-600 underline"
-                            >
-                              {expanded[p.key] ? "Hide logs" : `View logs (${p.segments.length})`}
-                            </button>
-                          )}
+                        <td className="px-3 py-2">
+                          <button
+                            className="rounded-full bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-600 transition hover:bg-blue-100 cursor-pointer"
+                            onClick={() =>
+                              setExpandedProject(isExpanded ? null : rowKey)
+                            }
+                          >
+                            {isExpanded ? "Hide details" : "View details"}
+                          </button>
                         </td>
                       </tr>
 
-                      {/* Logs */}
-                      {expanded[p.key] && (
-                        <tr className="bg-gray-50">
-                          <td colSpan={9} className="px-6 py-3">
-                            <div className="text-xs font-semibold text-gray-600 mb-1">
-                              Time Logs
+                      {/* Day-wise details */}
+                      {isExpanded && (
+                        <tr className="bg-slate-50">
+                          <td colSpan={4} className="px-4 py-3">
+                            <div className="text-sm font-medium mb-2">
+                              Day-wise work – {p.projectName} ({p.taskType})
                             </div>
-                            <ul className="space-y-1 text-xs font-mono text-gray-700">
-                              {p.segments.map((seg, i) => (
-                                <li key={i}>
-                                  • {new Date(seg.start).toLocaleTimeString()} →{" "}
-                                  {new Date(seg.end).toLocaleTimeString()}
-                                </li>
-                              ))}
-                            </ul>
+
+                            <table className="w-full text-xs overflow-hidden rounded-xl border">
+                              <thead className="bg-slate-100">
+                                <tr>
+                                  <th className="px-2 py-1 text-left">Date</th>
+                                  <th className="px-2 py-1 text-left">
+                                    Total Hours
+                                  </th>
+                                </tr>
+                              </thead>
+
+                              <tbody>
+                                {projectDailyBreakdown
+                                  .filter(
+                                    (d) =>
+                                      d.projectName === p.projectName &&
+                                      d.taskType === p.taskType,
+                                  )
+                                  .map((d, idx) => (
+                                    <tr key={idx} className="border-t">
+                                      <td className="px-2 py-1">{d.date}</td>
+                                      <td className="px-2 py-1">
+                                        {minutesToHHMM(d.totalMinutes)}
+                                      </td>
+                                    </tr>
+                                  ))}
+                              </tbody>
+                            </table>
                           </td>
                         </tr>
                       )}
                     </React.Fragment>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-
-          {view === "project" && (
-            <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm mt-4">
-              <h3 className="text-lg font-semibold mb-3">Project – Work Summary</h3>
-              {projectSummary.length === 0 ? (
-                <p className="text-sm text-gray-500">No project work found</p>
-              ) : (
-                <table className="w-full text-sm table-fixed border-collapse">
-                  <thead className="bg-gray-50">
-                    <tr>
-                      <th className="px-3 py-2 text-left">Project</th>
-                      <th className="px-3 py-2 text-left">Work Type</th>
-                      <th className="px-3 py-2 text-left">Total Hours</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {projectSummary.map((p, i) => (
-                      <React.Fragment key={i}>
-                        <tr className="border-t">
-                          <td className="px-3 py-2 font-medium">{p.projectName}</td>
-                          <td className="px-3 py-2">{p.taskType}</td>
-                          <td className="px-3 py-2">{minutesToHHMM(p.totalMinutes)}</td>
-                          <td className="px-3 py-2">
-                            <button
-                              className="text-xs text-blue-600 underline"
-                              onClick={() => setExpandedProject(expandedProject === p.projectName ? null : p.projectName)}
-                            >
-                              {expandedProject === p.projectName ? "Hide details" : "View details"}
-                            </button>
-                          </td>
-                        </tr>
-
-                        {/* Day-wise details */}
-                        {expandedProject === p.projectName && (
-                          <tr className="bg-gray-50">
-                            <td colSpan={4} className="px-4 py-3">
-                              <div className="text-sm font-medium mb-2">
-                                Day-wise work – {p.projectName}
-                              </div>
-                              <table className="w-full text-xs border rounded">
-                                <thead className="bg-gray-100">
-                                  <tr>
-                                    <th className="px-2 py-1 text-left">Date</th>
-                                    <th className="px-2 py-1 text-left">Total Hours</th>
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {projectDailyBreakdown
-                                    .filter(d => d.projectName === p.projectName)
-                                    .map((d, idx) => (
-                                      <tr key={idx} className="border-t">
-                                        <td className="px-2 py-1">{d.date}</td>
-                                        <td className="px-2 py-1">{minutesToHHMM(d.totalMinutes)}</td>
-                                      </tr>
-                                    ))}
-                                </tbody>
-                              </table>
-                            </td>
-                          </tr>
-                        )}
-                      </React.Fragment>
-                    ))}
-                  </tbody>
-                </table>
-              )}
-            </div>
+                  );
+                })}
+              </tbody>
+            </table>
           )}
         </div>
+      </div>
+    )}
+  </div>
+</div>
       </div>
     </div>
   );

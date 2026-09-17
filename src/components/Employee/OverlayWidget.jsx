@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { api } from "../../api";
+import { offlineManager } from "../../utils/offlineManager";
 
 export default function OverlayWidget() {
   // 🔹 get auth (employee only)
@@ -16,15 +17,38 @@ export default function OverlayWidget() {
   const [activeSession, setActiveSession] = useState(null);
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState("");
+  const [isOffline, setIsOffline] = useState(offlineManager.isOffline());
 
   const timerRef = useRef(null);
   const cardRef = useRef(null);
-
-  // keep a ref to current activeSession (for debugging / future use)
   const activeSessionRef = useRef(null);
+
+  // Sync state with Electron main process and other windows
   useEffect(() => {
     activeSessionRef.current = activeSession;
+    const isRunning = Boolean(
+      activeSession && (activeSession.status === "active" || activeSession.status === "paused")
+    );
+    window.worktracker?.setTimerRunning?.(isRunning);
+
+    const isTimerActive = Boolean(activeSession && activeSession.status === "active");
+    window.dispatchEvent(
+      new CustomEvent("timer:statusChanged", {
+        detail: {
+          isRunning: isTimerActive,
+          status: activeSession?.status || "stopped",
+        },
+      })
+    );
   }, [activeSession]);
+
+  useEffect(() => {
+    const unsub = offlineManager.subscribe((event, data) => {
+      if (event === "networkStatus") setIsOffline(data.isOffline);
+      if (event === "syncSuccess") loadSessions();
+    });
+    return unsub;
+  }, []);
 
   // ---------- helpers ----------
   const fmt = (ms) => {
@@ -32,11 +56,10 @@ export default function OverlayWidget() {
     const h = Math.floor(s / 3600);
     const m = Math.floor((s % 3600) / 60);
     const ss = s % 60;
-    const cc = Math.floor((ms % 1000) / 10);
     return `${String(h).padStart(2, "0")}:${String(m).padStart(
       2,
       "0"
-    )}:${String(ss).padStart(2, "0")}.${String(cc).padStart(2, "0")}`;
+    )}:${String(ss).padStart(2, "0")}`;
   };
 
   function clearTicker() {
@@ -46,49 +69,84 @@ export default function OverlayWidget() {
     }
   }
 
-  // ---------- load + start/stop ticker based on backend state ----------
-  async function loadSessions() {
+  async function loadSessions(retryCount = 0) {
     setError("");
-    try {
-      const today = new Date().toISOString().slice(0, 10);
 
-      const list = await api(
-        `/api/work-sessions/my?from=${today}&to=${today}`,
-        { token: auth.token }
-      );
+    try {
+      const now = new Date();
+      const y = now.getFullYear();
+      const m = String(now.getMonth() + 1).padStart(2, "0");
+      const d = String(now.getDate()).padStart(2, "0");
+      const today = `${y}-${m}-${d}`;
+
+      const list = await api(`/api/work-sessions/my?from=${today}&to=${today}`, { token: auth.token });
+      offlineManager.setOffline(false);
+      setIsOffline(false);
+
       const arr = Array.isArray(list) ? list : [];
       setSessions(arr);
 
       const running = arr.find((x) => x.status === "active");
       const paused = arr.find((x) => x.status === "paused");
+
+      // Strictly resolve to running/paused or null (never keep stale active session when stopped)
       const cur = running || paused || null;
       setActiveSession(cur);
+      activeSessionRef.current = cur;
 
-      // 🔹 reset local timer based on new state
       clearTicker();
 
       if (running) {
         const baseMs = Math.max(0, (running.accumulatedMinutes || 0) * 60000);
-        const start = new Date(
-          running.currentStart || running.createdAt
-        ).getTime();
-
-        const tick = () => {
-          setElapsed(baseMs + Math.max(0, Date.now() - start));
-        };
-
-        // run once immediately
+        const start = new Date(running.currentStart || running.createdAt).getTime();
+        const tick = () => setElapsed(baseMs + Math.max(0, Date.now() - start));
         tick();
-        // start interval
-        timerRef.current = setInterval(tick, 100);
+        timerRef.current = setInterval(tick, 1000);
+      } else if (paused) {
+        setElapsed(Math.max(0, (paused.totalMinutes || 0) * 60000));
       } else {
-        // no active session → just show persisted minutes
-        setElapsed(Math.max(0, (paused?.totalMinutes || 0) * 60000));
+        setElapsed(0);
       }
     } catch (e) {
       console.error("Overlay: error loading sessions", e);
-      setError("Overlay: could not load sessions");
-      clearTicker();
+
+      // Check if offline
+      if (e?.isOffline || !navigator.onLine || e?.status === 0) {
+        offlineManager.setOffline(true);
+        setIsOffline(true);
+
+        const offSess = offlineManager.getOfflineSession();
+        if (offSess && (offSess.status === "active" || offSess.status === "paused")) {
+          setActiveSession(offSess);
+          activeSessionRef.current = offSess;
+          clearTicker();
+          if (offSess.status === "active") {
+            const baseMs = Math.max(0, (offSess.accumulatedMinutes || 0) * 60000);
+            const start = new Date(offSess.currentStart || offSess.createdAt).getTime();
+            const tick = () => setElapsed(baseMs + Math.max(0, Date.now() - start));
+            tick();
+            timerRef.current = setInterval(tick, 1000);
+          } else if (offSess.status === "paused") {
+            setElapsed(Math.max(0, (offSess.totalMinutes || offSess.accumulatedMinutes || 0) * 60000));
+          }
+          return;
+        } else {
+          setActiveSession(null);
+          activeSessionRef.current = null;
+          clearTicker();
+          setElapsed(0);
+          return;
+        }
+      }
+
+      if (e.status === 401) {
+        window.location.href = "/login";
+        return;
+      }
+
+      if (retryCount < 2 && !offlineManager.isOffline()) {
+        setTimeout(() => loadSessions(retryCount + 1), 2000);
+      }
     }
   }
 
@@ -96,84 +154,43 @@ export default function OverlayWidget() {
   useEffect(() => {
     loadSessions();
     return () => clearTicker();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 🔄 Periodic auto-sync every 10 seconds to ensure overlay never desyncs from backend
+  useEffect(() => {
+    const syncInterval = setInterval(() => {
+      if (!offlineManager.isOffline()) {
+        loadSessions();
+      }
+    }, 10000);
+
+    return () => clearInterval(syncInterval);
   }, []);
 
   // ---------- respond to sessions:changed from WorkTimer / main window ----------
   useEffect(() => {
     const off = window.worktracker?.onSessionsChanged?.(() => {
-      // whenever any renderer says "sessions changed", reload + restart ticker
       loadSessions();
     });
 
     return () => {
       if (typeof off === "function") off();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ---------- auto-fit HEIGHT only ----------
-// ---------- MANUAL FIXED OVERLAY SIZE ----------
-useEffect(() => {
-  window.worktracker?.resizeOverlay?.({
-    width: 180,
-    height: 28, // 👈 FIXED HEIGHT (you can change 32 to 34 or 36)
-  });
-}, []);
+  useEffect(() => {
+    window.worktracker?.resizeOverlay?.({
+      width: 180,
+      height: 28,
+    });
+  }, []);
 
-
-  // 🔥 AUTO-PAUSE WHEN SYSTEM IS IDLE (overlay side)
-// useEffect(() => {
-//   const handler = () => {
-//     console.log("Overlay: system:idle → auto pause");
-
-//     const cur = activeSessionRef.current;
-//     if (!cur || cur.status !== "active") return;
-
-//     // share the same idle flag as WorkTimer
-//     localStorage.setItem("wt_idle_paused", "1");
-
-//     clearTicker();
-//     setElapsed((prev) => prev);
-
-//     // pause backend (idempotent) + sessions:changed + reload
-//     doPause();
-//   };
-
-//   const off = window.worktracker?.onSystemIdle?.(handler);
-//   return () => {
-//     if (typeof off === "function") off();
-//   };
-// }, []);
-
-// 🔥 AUTO-RESUME WHEN USER BECOMES ACTIVE (overlay side)
-// useEffect(() => {
-//   const handler = () => {
-//     const flag = localStorage.getItem("wt_idle_paused");
-//     if (flag !== "1") return;
-
-//     console.log("Overlay: system:active → idle auto-resume");
-
-//     // clear flag so it only runs once
-//     localStorage.removeItem("wt_idle_paused");
-
-//     // resume backend session + sessions:changed
-//     // loadSessions() in finally will restart local ticker
-//     doResume();
-//   };
-
-//   const off = window.worktracker?.onSystemActive?.(handler);
-//   return () => {
-//     if (typeof off === "function") off();
-//   };
-// }, []);
-
-
-  // ---------- actions (manual buttons) ----------
+  // ---------- actions (manual buttons) with offline fallbacks ----------
   async function doStart() {
     const lastProjectId = localStorage.getItem("lastProjectId");
     if (!lastProjectId) {
-      alert("Open main app once and choose a project before starting.");
+      setError("Choose project in main app first");
+      setTimeout(() => setError(""), 4000);
       return;
     }
     try {
@@ -182,6 +199,16 @@ useEffect(() => {
         token: auth.token,
         body: { projectId: lastProjectId },
       });
+      offlineManager.setOffline(false);
+      setIsOffline(false);
+    } catch (e) {
+      if (e?.isOffline || !navigator.onLine || e?.status === 0) {
+        offlineManager.startOfflineSession({
+          projectId: lastProjectId,
+          projectName: "Project",
+        });
+        setIsOffline(true);
+      }
     } finally {
       window.worktracker?.notifySessionsChanged?.();
       loadSessions();
@@ -194,6 +221,13 @@ useEffect(() => {
         method: "POST",
         token: auth.token,
       });
+      offlineManager.setOffline(false);
+      setIsOffline(false);
+    } catch (e) {
+      if (e?.isOffline || !navigator.onLine || e?.status === 0) {
+        offlineManager.pauseOfflineSession();
+        setIsOffline(true);
+      }
     } finally {
       window.worktracker?.notifySessionsChanged?.();
       loadSessions();
@@ -206,6 +240,13 @@ useEffect(() => {
         method: "POST",
         token: auth.token,
       });
+      offlineManager.setOffline(false);
+      setIsOffline(false);
+    } catch (e) {
+      if (e?.isOffline || !navigator.onLine || e?.status === 0) {
+        offlineManager.resumeOfflineSession();
+        setIsOffline(true);
+      }
     } finally {
       window.worktracker?.notifySessionsChanged?.();
       loadSessions();
@@ -213,11 +254,23 @@ useEffect(() => {
   }
 
   async function doStop() {
+    clearTicker();
+    setActiveSession(null);
+    activeSessionRef.current = null;
+    setElapsed(0);
+
     try {
       await api("/api/work-sessions/stop", {
         method: "POST",
         token: auth.token,
       });
+      offlineManager.setOffline(false);
+      setIsOffline(false);
+    } catch (e) {
+      if (e?.isOffline || !navigator.onLine || e?.status === 0) {
+        offlineManager.stopOfflineSession();
+        setIsOffline(true);
+      }
     } finally {
       window.worktracker?.notifySessionsChanged?.();
       loadSessions();
@@ -234,58 +287,60 @@ useEffect(() => {
   const primaryDisabled = !hasRunning && !hasPaused && !lastProjectId;
   const primaryAction = hasRunning ? doPause : hasPaused ? doResume : doStart;
 
-return (
- <div
-  ref={cardRef}
-  className="rounded-lg flex items-center overflow-hidden"
-  style={{
-    WebkitAppRegion: "drag",
-    height: "28px",
-    paddingLeft: "6px",
-    paddingRight: "6px",
-    backgroundColor: "#F8FAFC",
-    boxShadow: "0 0 0 1px rgba(0,0,0,0.08)",
-  }}
->
+  return (
+    <div
+      ref={cardRef}
+      className="rounded-lg flex items-center overflow-hidden"
+      style={{
+        WebkitAppRegion: "drag",
+        height: "28px",
+        paddingLeft: "6px",
+        paddingRight: "6px",
+        backgroundColor: "#F8FAFC",
+        boxShadow: "0 0 0 1px rgba(0,0,0,0.08)",
+      }}
+    >
+      <div className="flex items-center gap-1 w-full">
+        {/* TIMER */}
+        <div
+          style={{
+            WebkitAppRegion: "no-drag",
+            color: isOffline ? "#D97706" : "#2563EB",
+          }}
+          className="flex-1 text-center font-mono text-[14px] leading-none tracking-tight cursor-pointer select-none flex items-center justify-center gap-1"
+          onClick={() => window.worktracker?.openMain?.()}
+          title={isOffline ? "Offline Mode - Saved Locally" : "Online"}
+        >
+          {isOffline && <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />}
+          <span>{fmt(elapsed)}</span>
+        </div>
 
-    <div className="flex items-center gap-1 w-full">
-      {/* TIMER */}
-      <div
-        style={{ WebkitAppRegion: "no-drag", color: "#2563EB" }}
-        className="flex-1 text-center font-mono text-[14px] leading-none tracking-tight cursor-pointer select-none"
-        onClick={() => window.worktracker?.openMain?.()}
-      >
-        {fmt(elapsed)}
+        {/* START / PAUSE / RESUME */}
+        <button
+          style={{ WebkitAppRegion: "no-drag" }}
+          className={`w-[18px] h-[18px] flex items-center justify-center rounded text-[9px] leading-none text-white disabled:opacity-40 ${
+            hasRunning
+              ? "bg-yellow-400 hover:bg-yellow-500"
+              : hasPaused
+              ? "bg-blue-500 hover:bg-blue-600"
+              : "bg-emerald-500 hover:bg-emerald-600"
+          }`}
+          disabled={primaryDisabled}
+          onClick={primaryAction}
+        >
+          {primaryIcon}
+        </button>
+
+        {/* STOP */}
+        <button
+          style={{ WebkitAppRegion: "no-drag" }}
+          className="w-[18px] h-[18px] flex items-center justify-center rounded bg-red-500 hover:bg-red-600 text-[9px] leading-none text-white disabled:opacity-40"
+          disabled={!anyCurrent}
+          onClick={doStop}
+        >
+          ■
+        </button>
       </div>
-
-      {/* START / PAUSE / RESUME */}
-      <button
-        style={{ WebkitAppRegion: "no-drag" }}
-        className={`w-[18px] h-[18px] flex items-center justify-center rounded text-[9px] leading-none text-white disabled:opacity-40 ${
-          hasRunning
-            ? "bg-yellow-400 hover:bg-yellow-500"
-            : hasPaused
-            ? "bg-blue-500 hover:bg-blue-600"
-            : "bg-emerald-500 hover:bg-emerald-600"
-        }`}
-        disabled={primaryDisabled}
-        onClick={primaryAction}
-      >
-        {primaryIcon}
-      </button>
-
-      {/* STOP */}
-      <button
-        style={{ WebkitAppRegion: "no-drag" }}
-        className="w-[18px] h-[18px] flex items-center justify-center rounded bg-red-500 hover:bg-red-600 text-[9px] leading-none text-white disabled:opacity-40"
-        disabled={!anyCurrent}
-        onClick={doStop}
-      >
-        ■
-      </button>
     </div>
-  </div>
-);
-
-
+  );
 }

@@ -1,1 +1,162 @@
 @import "tailwindcss";
+
+/* ==========================================================================
+   THEME SYSTEM — Work Tracker & Project Planner
+   When .dark is present: Sleek Obsidian & Dark Slate Theme.
+   When .dark is NOT present: 100% original Work Tracker light colors preserved!
+   ========================================================================== */
+
+html.dark,
+.dark {
+  color-scheme: dark;
+}
+
+/* Base Body & Container Backgrounds */
+.dark body,
+.dark .bg-gray-50,
+.dark .bg-slate-50 {
+  background-color: #0b0f19 !important;
+  color: #f1f5f9 !important;
+}
+
+.dark .bg-white {
+  background-color: #131b2e !important;
+  color: #f1f5f9 !important;
+}
+
+.dark .bg-gray-100,
+.dark .bg-slate-100 {
+  background-color: #1a253c !important;
+  color: #e2e8f0 !important;
+}
+
+.dark .bg-gray-200,
+.dark .bg-slate-200 {
+  background-color: #24324f !important;
+}
+
+/* Header & Sidebar */
+.dark header,
+.dark header.bg-white {
+  background-color: #0d1527 !important;
+  border-color: #1e293b !important;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4) !important;
+}
+
+.dark aside,
+.dark aside.bg-white {
+  background-color: #0d1527 !important;
+  border-color: #1e293b !important;
+}
+
+.dark aside button.text-gray-700 {
+  color: #94a3b8 !important;
+}
+
+.dark aside button.text-gray-700:hover {
+  background-color: #1a253c !important;
+  color: #f8fafc !important;
+}
+
+/* Borders */
+.dark .border,
+.dark .border-b,
+.dark .border-t,
+.dark .border-l,
+.dark .border-r,
+.dark .border-gray-200,
+.dark .border-gray-300,
+.dark .border-gray-400,
+.dark .border-gray-600,
+.dark .border-slate-200,
+.dark .border-slate-300 {
+  border-color: #22304d !important;
+}
+
+/* Typography */
+.dark .text-gray-900,
+.dark .text-slate-900,
+.dark .text-gray-800,
+.dark .text-slate-800 {
+  color: #f8fafc !important;
+}
+
+.dark .text-gray-700,
+.dark .text-slate-700,
+.dark .text-gray-600,
+.dark .text-slate-600 {
+  color: #cbd5e1 !important;
+}
+
+.dark .text-gray-500,
+.dark .text-slate-500,
+.dark .text-gray-400,
+.dark .text-slate-400 {
+  color: #94a3b8 !important;
+}
+
+.dark .text-blue-800 {
+  color: #60a5fa !important;
+}
+
+.dark .text-blue-600 {
+  color: #93c5fd !important;
+}
+
+/* Form Controls */
+.dark input:not([type="checkbox"]):not([type="radio"]),
+.dark select,
+.dark textarea {
+  background-color: #17223b !important;
+  color: #f8fafc !important;
+  border-color: #2b3d63 !important;
+}
+
+.dark input:focus,
+.dark select:focus,
+.dark textarea:focus {
+  border-color: #6366f1 !important;
+  outline: none !important;
+}
+
+.dark input::placeholder,
+.dark textarea::placeholder {
+  color: #64748b !important;
+}
+
+/* Tables */
+.dark table {
+  background-color: #131b2e !important;
+  color: #f1f5f9 !important;
+}
+
+.dark thead,
+.dark thead.bg-gray-50,
+.dark thead.bg-slate-50 {
+  background-color: #17223b !important;
+  color: #94a3b8 !important;
+  border-color: #22304d !important;
+}
+
+.dark tr:hover {
+  background-color: rgba(255, 255, 255, 0.03) !important;
+}
+
+.dark td {
+  border-color: #1e2a42 !important;
+}
+
+/* Modals & Dialogs */
+.dark .bg-black\/40,
+.dark .bg-black\/50,
+.dark .bg-slate-900\/60 {
+  background-color: rgba(4, 6, 15, 0.85) !important;
+}
+
+/* Cards & Shadows */
+.dark .shadow-sm,
+.dark .shadow-md,
+.dark .shadow-lg,
+.dark .shadow-xl {
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45) !important;
+}
